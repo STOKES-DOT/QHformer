@@ -30,24 +30,22 @@ This guarantees that attention scores are invariant to molecular rotations.
 
 ## 🏗️ Architecture
 
-$$
-\begin{aligned}
-\text{Input: } & \text{Molecular Geometry } (\mathbf{r}_i, z_i) \\
-& \downarrow \\
-\text{[Node Embedding]} & \rightarrow h_i^{(0)} \\
-& \downarrow \\
-\text{[GNN Layers]} & \times \text{num\_gnn\_layers} \\
-& \qquad \text{1. Query Projection} \\
-& \qquad \text{2. Key TP with Edge SH} \\
-& \qquad \text{3. Inner Product Attention} \\
-& \qquad \text{4. Value TP + Aggregation} \\
-& \qquad \text{5. Feed-forward Network} \\
-& \downarrow \\
-\text{[Hamiltonian Block]} & \rightarrow H \in \mathbb{R}^{n_{\text{orb}} \times n_{\text{orb}}} \\
-& \downarrow \\
-\text{Output: } & \text{Hamiltonian Matrix}
-\end{aligned}
-$$
+```
+Input:  Molecular Geometry (𝐫_i, z_i)
+           ↓
+Node Embedding → h_i^(0)
+           ↓
+GNN Layers (×num_gnn_layers)
+  ├─ 1. Query Projection
+  ├─ 2. Key TP with Edge SH
+  ├─ 3. Inner Product Attention
+  ├─ 4. Value TP + Aggregation
+  └─ 5. Feed-forward Network
+           ↓
+Hamiltonian Block → H ∈ ℝ^(n_orb × n_orb)
+           ↓
+Output:  Hamiltonian Matrix
+```
 
 ## 📁 Project Structure
 
@@ -175,13 +173,22 @@ $$
 
 ### Tensor Product
 
-The tensor product of two irreps decomposes as:
+The tensor product of two irreps decomposes as a direct sum:
 
 $$ V^{l_1} \otimes V^{l_2} = \bigoplus_{L=|l_1-l_2|}^{l_1+l_2} V^L $$
 
-Using Clebsch-Gordan coefficients $C^{L,M}_{l_1,m_1;l_2,m_2}$:
+**Example**:
 
-$$ Y^{l_1}_{m_1} \otimes Y^{l_2}_{m_2} = \sum_{L=|l_1-l_2|}^{l_1+l_2} \sum_{M=-L}^{L} C^{L,M}_{l_1,m_1;l_2,m_2} Y^L_M $$
+$$ V^1_o \otimes V^1_o = V^0_e \oplus V^1_o \oplus V^2_e $$
+
+Using Clebsch-Gordan coefficients $C_{l_1,m_1,l_2m_2}^{l_3m_3}$:
+
+$$\nu_1^{l_1}\otimes\nu_1^{l_1}=\sum_{m_1=-l_1}^{l_1}\sum_{m_2=-l_2}^{l_2}C_{l_1,m_1,l_2m_2}^{l_3m_3}\nu_{1m_1}^{l_1}\nu_{2m_2}^{l_2}$$
+
+**Selection Rules**:
+- $M = m_1 + m_2$ (magnetic quantum number conservation)
+- $|l_1 - l_2| \leq L \leq l_1 + l_2$ (triangle inequality)
+- $l_1 + l_2 + L$ is even (for real spherical harmonics)
 
 ## 📈 Training Configuration
 
@@ -257,8 +264,8 @@ The model expects molecular data in the following format:
 | Training Samples | 3,999 |
 | Validation Samples | 1,000 |
 | Total Epochs | 15,000 |
-| Best Val MAE | $1.2 \times 10^{-5}$ (epoch 14950) |
-| Final Val MAE | $1.3 \times 10^{-5}$ |
+| Best Val MAE | $1.2 \times 10^{-5}$ Hartree (epoch 14950) |
+| Final Val MAE | $1.3 \times 10^{-5}$ Hartree |
 | Training Time | ~5 days (CUDA) |
 | Equivariance | Verified ✓ |
 
@@ -266,10 +273,10 @@ The model expects molecular data in the following format:
 
 The model achieved excellent convergence with no overfitting:
 
-- **Rapid initial convergence**: MAE dropped from 0.25 to $10^{-4}$ in first 100 epochs
+- **Rapid initial convergence**: MAE dropped from 0.25 to $10^{-4}$ Hartree in first 100 epochs
 - **Stable optimization**: Consistent improvement over 15,000 epochs
 - **No overfitting**: Training and validation MAE track closely
-- **Best performance**: $1.2 \times 10^{-5}$ MAE on validation set
+- **Best performance**: $1.2 \times 10^{-5}$ Hartree MAE on validation set
 
 ![Training Curves](images/training_curves.png)
 
@@ -284,17 +291,6 @@ The model achieves high-accuracy Hamiltonian prediction:
 Prediction errors are concentrated around zero with minimal outliers:
 
 ![Error Distribution](images/error_distribution.png)
-
-### Equivariance Verification
-
-The model maintains rotational symmetry:
-
-$$
-\begin{aligned}
-|H(\mathbf{r}) - H(R \cdot \mathbf{r})| &\approx 0 \quad \text{(after rotation)} \\
-\text{Tr}(H(\mathbf{r})) - \text{Tr}(H(R \cdot \mathbf{r})) &\approx 0 \quad \text{(invariant)}
-\end{aligned}
-$$
 
 ## 🔧 Troubleshooting
 
