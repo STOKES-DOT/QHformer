@@ -9,46 +9,45 @@ A novel neural network architecture for predicting quantum Hamiltonian matrices 
 QHformer introduces **Inner Product Attention** that preserves complete irreducible representations throughout the attention computation, unlike traditional methods that compress Query/Key to scalars.
 
 **Mathematical Foundation:**
-```
-Query:  q_i = Linear(h_i)  → Full Irreps (no compression)
-Key:    k_ij = TP(h_j, Y(𝐫_ij))  → Full Irreps
-Value:  v_ij = TP(h_j, Y(𝐫_ij))  → Hidden Irreps
 
-Attention: α_ij = softmax(⟨q_i, k_ij⟩_l / √d)
-
-Update:   h_i' = h_i + Σ_j α_ij · v_ij
-```
+$$
+\begin{aligned}
+\text{Query: } & q_i = \text{Linear}(h_i) \rightarrow \text{Full Irreps (no compression)} \\
+\text{Key: } & k_{ij} = \text{TP}(h_j, Y(\mathbf{r}_{ij})) \rightarrow \text{Full Irreps} \\
+\text{Value: } & v_{ij} = \text{TP}(h_j, Y(\mathbf{r}_{ij})) \rightarrow \text{Hidden Irreps} \\
+\text{Attention: } & \alpha_{ij} = \text{softmax}(\langle q_i, k_{ij} \rangle_l / \sqrt{d}) \\
+\text{Update: } & h_i' = h_i + \sum_j \alpha_{ij} \cdot v_{ij}
+\end{aligned}
+$$
 
 **Theorem (Rotation Invariance):**
-For features `x, y ∈ V^l` in the same irreducible representation:
-```
-⟨R·x, R·y⟩_l = ⟨x, y⟩_l  ∀ R ∈ SO(3)
-```
+
+For features $x, y \in V^l$ in the same irreducible representation:
+
+$$ \langle R \cdot x, R \cdot y \rangle_l = \langle x, y \rangle_l \quad \forall R \in \text{SO}(3) $$
 
 This guarantees that attention scores are invariant to molecular rotations.
 
 ## 🏗️ Architecture
 
-```
-Input: Molecular Geometry (𝐫_i, z_i)
-   ↓
-[Node Embedding] → h_i^(0)
-   ↓
-┌─────────────────────────────────────┐
-│  GNN Layers (×num_gnn_layers)       │
-│  ┌───────────────────────────────┐  │
-│  │ 1. Query Projection           │  │
-│  │ 2. Key TP with Edge SH        │  │
-│  │ 3. Inner Product Attention    │  │
-│  │ 4. Value TP + Aggregation     │  │
-│  │ 5. Feed-forward Network       │  │
-│  └───────────────────────────────┘  │
-└─────────────────────────────────────┘
-   ↓
-[Hamiltonian Block] → H ∈ ℝ^(n_orb × n_orb)
-   ↓
-Output: Hamiltonian Matrix
-```
+$$
+\begin{aligned}
+\text{Input: } & \text{Molecular Geometry } (\mathbf{r}_i, z_i) \\
+& \downarrow \\
+\text{[Node Embedding]} & \rightarrow h_i^{(0)} \\
+& \downarrow \\
+\text{[GNN Layers]} & \times \text{num\_gnn\_layers} \\
+& \qquad \text{1. Query Projection} \\
+& \qquad \text{2. Key TP with Edge SH} \\
+& \qquad \text{3. Inner Product Attention} \\
+& \qquad \text{4. Value TP + Aggregation} \\
+& \qquad \text{5. Feed-forward Network} \\
+& \downarrow \\
+\text{[Hamiltonian Block]} & \rightarrow H \in \mathbb{R}^{n_{\text{orb}} \times n_{\text{orb}}} \\
+& \downarrow \\
+\text{Output: } & \text{Hamiltonian Matrix}
+\end{aligned}
+$$
 
 ## 📁 Project Structure
 
@@ -151,40 +150,38 @@ hamiltonian = outputs['hamiltonian']  # Shape: (batch, n_orb, n_orb)
 
 ### SO(3) Equivariance
 
-A function `f: ℝ^(3N) × ℤ^N → V^l_out` is SO(3)-equivariant if:
-```
-f({R·𝐫_i, z_i}) = D^l_out(R) · f({𝐫_i, z_i})  ∀ R ∈ SO(3)
-```
+A function $f: \mathbb{R}^{3N} \times \mathbb{Z}^N \rightarrow V^{l_{\text{out}}}$ is SO(3)-equivariant if:
+
+$$ f(\{R \cdot \mathbf{r}_i, z_i\}_{i=1}^N) = D^{l_{\text{out}}}(R) \cdot f(\{\mathbf{r}_i, z_i\}_{i=1}^N) \quad \forall R \in \text{SO}(3) $$
 
 For Hamiltonian prediction:
-```
-H_μν({R·𝐫_i}) = Σ_μ',ν' D(R)_{μμ'} D(R)_{νν'} H_μ'ν'({𝐫_i})
-```
+
+$$ H_{\mu\nu}(\{R \cdot \mathbf{r}_i\}) = \sum_{\mu',\nu'} D(R)_{\mu\mu'} D(R)_{\nu\nu'} H_{\mu'\nu'}(\{\mathbf{r}_i\}) $$
 
 ### Inner Product Invariance Proof
 
-For irreps `V^l` with Wigner D-matrices `D^l(R)`:
+For irreps $V^l$ with Wigner D-matrices $D^l(R)$:
 
-```
-⟨R·x, R·y⟩_l = Σ_m (R·x)_m (R·y)_m
-              = Σ_m [Σ_m' D^l_mm'(R) x_m'] [Σ_m'' D^l_mm''(R) y_m'']
-              = Σ_m',m'' x_m' y_m'' Σ_m D^l_mm'(R) D^l_mm''(R)
-              = Σ_m',m'' x_m' y_m'' δ_m'm''    (orthogonality)
-              = Σ_m x_m y_m
-              = ⟨x, y⟩_l  ✓
-```
+$$
+\begin{aligned}
+\langle R \cdot x, R \cdot y \rangle_l &= \sum_{m=-l}^{l} (R \cdot x)_m (R \cdot y)_m \\
+&= \sum_{m=-l}^{l} \left[ \sum_{m'=-l}^{l} D^l_{mm'}(R) x_{m'} \right] \left[ \sum_{m''=-l}^{l} D^l_{mm''}(R) y_{m''} \right] \\
+&= \sum_{m',m''=-l}^{l} x_{m'} y_{m''} \sum_{m=-l}^{l} D^l_{mm'}(R) D^l_{mm''}(R) \\
+&= \sum_{m',m''=-l}^{l} x_{m'} y_{m''} \delta_{m'm''} \quad \text{(orthogonality)} \\
+&= \sum_{m=-l}^{l} x_m y_m \\
+&= \langle x, y \rangle_l \quad \checkmark
+\end{aligned}
+$$
 
 ### Tensor Product
 
 The tensor product of two irreps decomposes as:
-```
-V^l1 ⊗ V^l2 = ⊕_{L=|l1-l2|}^{l1+l2} V^L
-```
 
-Using Clebsch-Gordan coefficients `C^{L,M}_{l1,m1;l2,m2}`:
-```
-Y^l1_m1 ⊗ Y^l2_m2 = Σ_{L,M} C^{L,M}_{l1,m1;l2,m2} Y^L_M
-```
+$$ V^{l_1} \otimes V^{l_2} = \bigoplus_{L=|l_1-l_2|}^{l_1+l_2} V^L $$
+
+Using Clebsch-Gordan coefficients $C^{L,M}_{l_1,m_1;l_2,m_2}$:
+
+$$ Y^{l_1}_{m_1} \otimes Y^{l_2}_{m_2} = \sum_{L=|l_1-l_2|}^{l_1+l_2} \sum_{M=-L}^{L} C^{L,M}_{l_1,m_1;l_2,m_2} Y^L_M $$
 
 ## 📈 Training Configuration
 
@@ -264,10 +261,13 @@ The model expects molecular data in the following format:
 ### Equivariance Verification
 
 The model maintains rotational symmetry:
-```
-|H(𝐫) - H(R·𝐫)| ≈ 0  (after rotation)
-Tr(H(𝐫)) - Tr(H(R·𝐫)) ≈ 0  (invariant)
-```
+
+$$
+\begin{aligned}
+|H(\mathbf{r}) - H(R \cdot \mathbf{r})| &\approx 0 \quad \text{(after rotation)} \\
+\text{Tr}(H(\mathbf{r})) - \text{Tr}(H(R \cdot \mathbf{r})) &\approx 0 \quad \text{(invariant)}
+\end{aligned}
+$$
 
 ## 🔧 Troubleshooting
 
