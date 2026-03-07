@@ -57,7 +57,8 @@ dataset/
 
 # Test outputs
 tests/
-*.png
+# Allow images in documentation
+!images/*.png
 *.gif
 *.jpg
 *.jpeg
