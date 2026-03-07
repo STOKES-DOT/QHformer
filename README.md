@@ -27,15 +27,6 @@ For features `x, y ∈ V^l` in the same irreducible representation:
 
 This guarantees that attention scores are invariant to molecular rotations.
 
-## 📊 Comparison with Other Methods
-
-| Method | Query/Key | Attention | Equivariance | Information Preserved |
-|--------|-----------|-----------|--------------|----------------------|
-| **QHformer** | Full Irreps | InnerProduct | ✅ Complete | ⭐⭐⭐⭐⭐ |
-| QHTransformer | Projected | Dot Product | ✅ Complete | ⭐⭐⭐ |
-| Equiformer | SO(2) Conv | Channel-wise | ✅ Complete | ⭐⭐⭐ |
-| Standard GNN | Scalar | Dot Product | ❌ None | ⭐ |
-
 ## 🏗️ Architecture
 
 ```
