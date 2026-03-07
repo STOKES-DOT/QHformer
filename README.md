@@ -254,9 +254,36 @@ The model expects molecular data in the following format:
 | Molecule | H₂O |
 | Orbitals | 24 (def2-SVP) |
 | Hamiltonian Size | 24 × 24 |
-| Training Samples | 2,000 |
-| Best MAE | 0.00974 (early training) |
+| Training Samples | 3,999 |
+| Validation Samples | 1,000 |
+| Total Epochs | 15,000 |
+| Best Val MAE | $1.2 \times 10^{-5}$ (epoch 14950) |
+| Final Val MAE | $1.3 \times 10^{-5}$ |
+| Training Time | ~5 days (CUDA) |
 | Equivariance | Verified ✓ |
+
+### Training Performance
+
+The model achieved excellent convergence with no overfitting:
+
+- **Rapid initial convergence**: MAE dropped from 0.25 to $10^{-4}$ in first 100 epochs
+- **Stable optimization**: Consistent improvement over 15,000 epochs
+- **No overfitting**: Training and validation MAE track closely
+- **Best performance**: $1.2 \times 10^{-5}$ MAE on validation set
+
+![Training Curves](images/training_curves.png)
+
+### Prediction Quality
+
+The model achieves high-accuracy Hamiltonian prediction:
+
+![Validation Predictions](images/predictions_val.png)
+
+### Error Distribution
+
+Prediction errors are concentrated around zero with minimal outliers:
+
+![Error Distribution](images/error_distribution.png)
 
 ### Equivariance Verification
 
