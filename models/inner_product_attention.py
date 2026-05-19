@@ -700,6 +700,24 @@ class MultiHeadAttentionLayer(nn.Module):
         )
         return merge_heads(attended_heads, value_irrep, self.num_heads)
 
+    def _select_topk(self, relevance, edge_dst, top_k):
+        if top_k is None or edge_dst.numel() == 0:
+            return torch.arange(edge_dst.numel(), dtype=torch.long, device=edge_dst.device)
+
+        scores = relevance.squeeze(-1)
+        edge_order = torch.argsort(scores, descending=True, stable=True)
+        dst_order = torch.argsort(edge_dst[edge_order], stable=True)
+        ordered = edge_order[dst_order]
+        ordered_dst = edge_dst[ordered]
+
+        positions = torch.arange(ordered.numel(), device=edge_dst.device)
+        is_group_start = torch.ones_like(ordered_dst, dtype=torch.bool)
+        is_group_start[1:] = ordered_dst[1:] != ordered_dst[:-1]
+        group_starts = torch.where(is_group_start, positions, torch.zeros_like(positions))
+        group_starts = torch.cummax(group_starts, dim=0).values
+        rank_in_group = positions - group_starts
+        return ordered[rank_in_group < top_k]
+
     def forward(self, data, x):
         edge_dst, edge_src = data.edge_index[0], data.edge_index[1]
         num_nodes = x.shape[0]
@@ -785,24 +803,6 @@ class CompressedSparseAttentionLayer(MultiHeadAttentionLayer):
                 nn.init.normal_(module.weight, mean=0.0, std=0.001)
                 nn.init.zeros_(module.bias)
 
-    def _select_topk(self, relevance, edge_dst, top_k):
-        if top_k is None or edge_dst.numel() == 0:
-            return torch.arange(edge_dst.numel(), dtype=torch.long, device=edge_dst.device)
-
-        scores = relevance.squeeze(-1)
-        edge_order = torch.argsort(scores, descending=True, stable=True)
-        dst_order = torch.argsort(edge_dst[edge_order], stable=True)
-        ordered = edge_order[dst_order]
-        ordered_dst = edge_dst[ordered]
-
-        positions = torch.arange(ordered.numel(), device=edge_dst.device)
-        is_group_start = torch.ones_like(ordered_dst, dtype=torch.bool)
-        is_group_start[1:] = ordered_dst[1:] != ordered_dst[:-1]
-        group_starts = torch.where(is_group_start, positions, torch.zeros_like(positions))
-        group_starts = torch.cummax(group_starts, dim=0).values
-        rank_in_group = positions - group_starts
-        return ordered[rank_in_group < top_k]
-
     def forward(self, data, x):
         edge_dst, edge_src = data.edge_index[0], data.edge_index[1]
         num_nodes = x.shape[0]
@@ -883,11 +883,13 @@ class CompressedSparseAttentionNetLayer(nn.Module):
 
 
 class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
-    """Multi-head HCA with l<=hca_lmax K/V compression and zero padding."""
+    """Multi-head HCA with sparse edge selection plus l<=hca_lmax K/V compression."""
 
-    def __init__(self, *args, hca_lmax=2, **kwargs):
+    def __init__(self, *args, hca_lmax=2, top_k=8, indexer_compress_dim=32, **kwargs):
         super().__init__(*args, **kwargs)
         self.hca_lmax = hca_lmax
+        self.top_k = top_k
+        self.indexer_compress_dim = indexer_compress_dim
         self.hca_key_irrep = _filter_irrep_lmax(self.irrep_in_node, hca_lmax)
         self.hca_value_irrep = _filter_irrep_lmax(self.irrep_hidden, hca_lmax)
 
@@ -942,7 +944,20 @@ class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
         )
         self.query_norm = MultiHeadEquivariantNorm(self.hca_key_irrep, self.num_heads)
         self.key_norm = MultiHeadEquivariantNorm(self.irrep_tp_key, self.num_heads)
+
+        num_mul = sum(mul for mul, _ in self.irrep_in_node)
+        s0_dim = num_mul + self.irrep_in_node[0][0]
+        scorer_in_dim = s0_dim + self.edge_attr_dim
+        self.indexer = nn.Sequential(
+            nn.Linear(scorer_in_dim, indexer_compress_dim),
+            nn.SiLU(),
+            nn.Linear(indexer_compress_dim, 1),
+        )
         self._init_weights()
+        for module in self.indexer:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.001)
+                nn.init.zeros_(module.bias)
 
     def forward(self, data, x):
         edge_dst, edge_src = data.edge_index[0], data.edge_index[1]
@@ -953,12 +968,23 @@ class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
             x = self.norm_gate(x)
             x = self.linear_node(x)
 
-        s0 = self._compute_s0(x, edge_dst, edge_src)
+        s0_full = self._compute_s0(x, edge_dst, edge_src)
+        relevance = self.indexer(torch.cat([s0_full, data.edge_attr], dim=-1))
+        sel_mask = self._select_topk(relevance, edge_dst, self.top_k)
+        sel_dst = edge_dst[sel_mask]
+        sel_src = edge_src[sel_mask]
+
         query = self.linear_query(x)
         query_hca = filter_irrep_tensor_lmax(query, self.irrep_in_node, self.hca_lmax)
-        key, value = self._project_key_value(x, edge_src, data.edge_sh, data.edge_attr, s0)
+        key, value = self._project_key_value(
+            x,
+            sel_src,
+            data.edge_sh[sel_mask],
+            data.edge_attr[sel_mask],
+            s0_full[sel_mask],
+        )
         attended_hca = self._multihead_attention(
-            query_hca, key, value, edge_dst,
+            query_hca, key, value, sel_dst,
             self.irrep_tp_key, self.irrep_tp_value, num_nodes,
         )
         attended = pad_irrep_tensor(attended_hca, self.irrep_tp_value, self.irrep_hidden)
@@ -985,6 +1011,8 @@ class HeavyCompressedAttentionNetLayer(nn.Module):
         attention_temperature=1.0,
         num_heads=4,
         hca_lmax=2,
+        top_k=8,
+        indexer_compress_dim=32,
         attention_score_residual_init_std=0.0,
     ):
         super().__init__()
@@ -1005,6 +1033,8 @@ class HeavyCompressedAttentionNetLayer(nn.Module):
             attention_temperature=attention_temperature,
             num_heads=num_heads,
             hca_lmax=hca_lmax,
+            top_k=top_k,
+            indexer_compress_dim=indexer_compress_dim,
             attention_score_residual_init_std=attention_score_residual_init_std,
         )
 

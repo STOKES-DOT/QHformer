@@ -143,6 +143,7 @@ class Config:
     num_heads = 4
     use_hybrid_attention = True
     csa_top_k = 8
+    hca_top_k = 8
     hca_lmax = 3
     indexer_compress_dim = 32
     attention_score_residual_init_std = 0.0
@@ -632,6 +633,7 @@ def main():
         num_heads=config.num_heads,
         use_hybrid_attention=config.use_hybrid_attention,
         csa_top_k=config.csa_top_k,
+        hca_top_k=config.hca_top_k,
         hca_lmax=config.hca_lmax,
         indexer_compress_dim=config.indexer_compress_dim,
         attention_score_residual_init_std=config.attention_score_residual_init_std,

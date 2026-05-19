@@ -440,6 +440,7 @@ class QHformer(nn.Module):
         num_heads: Number of multiplicity-split attention heads (default: 4)
         use_hybrid_attention: Use CSA-HCA-CSA-HCA alternation when True
         csa_top_k: Max incoming edges per node in CSA layers
+        hca_top_k: Max incoming edges per node in edge-sparse HCA layers
         hca_lmax: Maximum angular degree retained in HCA K/V compression
         indexer_compress_dim: Hidden dimension of CSA Lightning Indexer
         attention_score_residual_init_std: Std for nonzero learnable attention-score residual init.
@@ -459,6 +460,7 @@ class QHformer(nn.Module):
         num_heads=4,
         use_hybrid_attention=True,
         csa_top_k=8,
+        hca_top_k=8,
         hca_lmax=2,
         indexer_compress_dim=32,
         attention_score_residual_init_std=0.0,
@@ -475,6 +477,7 @@ class QHformer(nn.Module):
         self.num_heads = num_heads
         self.use_hybrid_attention = use_hybrid_attention
         self.csa_top_k = csa_top_k
+        self.hca_top_k = hca_top_k
         self.hca_lmax = hca_lmax
         self.indexer_compress_dim = indexer_compress_dim
         self.attention_score_residual_init_std = attention_score_residual_init_std
@@ -502,6 +505,7 @@ class QHformer(nn.Module):
         if use_hybrid_attention:
             print(f"  pattern = CSA-HCA-CSA-HCA")
             print(f"  csa_top_k = {csa_top_k}")
+            print(f"  hca_top_k = {hca_top_k}")
             print(f"  hca_lmax = {hca_lmax}")
         print(f"  attention_score_residual_init_std = {attention_score_residual_init_std}")
         print(f"  Query/Key irreps = {self.hidden_irrep}")
@@ -543,6 +547,8 @@ class QHformer(nn.Module):
                         attention_temperature=attention_temperature,
                         num_heads=num_heads,
                         hca_lmax=hca_lmax,
+                        top_k=hca_top_k,
+                        indexer_compress_dim=indexer_compress_dim,
                         attention_score_residual_init_std=attention_score_residual_init_std,
                     )
             else:
