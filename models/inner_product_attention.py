@@ -25,46 +25,10 @@ from e3nn import o3
 from e3nn.o3 import Linear, TensorProduct
 from e3nn.nn import FullyConnectedNet
 
-# Scatter function with fallback
 try:
-    from torch_scatter import scatter as torch_scatter_fn
-    HAS_TORCH_SCATTER = True
+    from .torch_ops import scatter
 except ImportError:
-    HAS_TORCH_SCATTER = False
-
-
-def scatter_pure(src, index, dim_size=None, dim=0, reduce='sum'):
-    """Pure PyTorch scatter implementation"""
-    if dim_size is None:
-        dim_size = int(index.max().item()) + 1 if index.numel() > 0 else 0
-
-    if index.dim() == 1:
-        index_shape = [1] * src.dim()
-        index_shape[dim] = index.shape[0]
-        index_expanded = index.reshape(index_shape).expand_as(src)
-    else:
-        index_expanded = index
-
-    if reduce == 'sum' or reduce == 'add':
-        out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index_expanded, src)
-    elif reduce == 'mean':
-        out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        counts = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        out.scatter_add_(dim, index_expanded, src)
-        counts.scatter_add_(dim, index_expanded, torch.ones_like(src))
-        return out / (counts.clamp(min=1))
-    else:
-        out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index_expanded, src)
-
-
-def scatter(src, index, dim_size=None, dim=0, reduce='sum'):
-    """Scatter function with fallback"""
-    if HAS_TORCH_SCATTER:
-        return torch_scatter_fn(src, index, dim=dim, dim_size=dim_size, reduce=reduce)
-    else:
-        return scatter_pure(src, index, dim_size=dim_size, dim=dim, reduce=reduce)
+    from torch_ops import scatter
 
 
 def get_feasible_irrep(irrep_in1, irrep_in2, cutoff_irrep_out, tp_mode="uvu"):

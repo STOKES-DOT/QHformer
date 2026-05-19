@@ -20,11 +20,10 @@ import torch.nn as nn
 import math
 from e3nn import o3
 
-# Use radius_graph from torch_cluster if available
 try:
-    from torch_cluster import radius_graph
+    from .torch_ops import radius_graph
 except ImportError:
-    from torch_geometric.nn import radius_graph
+    from torch_ops import radius_graph
 
 # Handle both relative and absolute imports
 try:
@@ -651,14 +650,27 @@ class QHformer(nn.Module):
 
     def forward(self, data, keep_blocks=False):
         """Forward pass with Inner Product Attention"""
-        # Build graph
-        node_attr, edge_index, rbf_new, edge_sh, _ = self.build_graph(data, self.max_radius)
+        # Build graph, or reuse static QH9 graph cache when present. The RBF
+        # layer remains live because its centers/std are trainable.
+        if all(hasattr(data, key) for key in ("edge_index", "edge_dist", "edge_sh")):
+            node_attr = data.atoms.squeeze()
+            edge_index = data.edge_index
+            rbf_new = self.distance_expansion(data.edge_dist.unsqueeze(-1)).squeeze().type(data.pos.type())
+            edge_sh = data.edge_sh.type(data.pos.type())
+        else:
+            node_attr, edge_index, rbf_new, edge_sh, _ = self.build_graph(data, self.max_radius)
         node_attr = self.node_embedding(node_attr)
         data.node_attr, data.edge_index, data.edge_attr, data.edge_sh = \
             node_attr, edge_index, rbf_new, edge_sh
 
-        # Build full graph for PairNet
-        _, full_edge_index, full_edge_attr, full_edge_sh, transpose_edge_index = self.build_graph(data, 10000)
+        # Build full graph for PairNet, or reuse cached complete graph.
+        if all(hasattr(data, key) for key in ("full_edge_index", "full_edge_dist", "full_edge_sh")):
+            full_edge_index = data.full_edge_index
+            full_edge_attr = self.distance_expansion(data.full_edge_dist.unsqueeze(-1)).squeeze().type(data.pos.type())
+            full_edge_sh = data.full_edge_sh.type(data.pos.type())
+            transpose_edge_index = getattr(data, "full_transpose_perm", None)
+        else:
+            _, full_edge_index, full_edge_attr, full_edge_sh, transpose_edge_index = self.build_graph(data, 10000)
         data.full_edge_index, data.full_edge_attr, data.full_edge_sh = \
             full_edge_index, full_edge_attr, full_edge_sh
 
@@ -759,30 +771,54 @@ class QHformer(nn.Module):
         return node_attr, radius_edges, rbf, edge_sh, torch.cat(all_transpose_index, dim=-1)
 
     def build_final_matrix(self, data, diagonal_matrix, non_diagonal_matrix):
-        """Assemble final Hamiltonian matrix from blocks"""
+        """Assemble final Hamiltonian matrix from orbital blocks.
+
+        This follows SPHNet's block2matrix pattern: fill a dense
+        [atom, atom, max_block, max_block] tensor first, then reshape and select
+        the atom-specific orbital rows/columns. The previous implementation
+        searched full_edge_index for every off-diagonal block, which introduced
+        many tiny GPU synchronizations.
+        """
         final_matrix = []
         dst, src = data.full_edge_index
+        max_block_size = diagonal_matrix.shape[-1]
+        edge_start = 0
         for graph_idx in range(data.ptr.shape[0] - 1):
-            matrix_block_col = []
-            for src_idx in range(data.ptr[graph_idx], data.ptr[graph_idx+1]):
-                matrix_col = []
-                for dst_idx in range(data.ptr[graph_idx], data.ptr[graph_idx+1]):
-                    if src_idx == dst_idx:
-                        matrix_col.append(diagonal_matrix[src_idx].index_select(
-                            -2, self.orbital_mask[data.atoms[dst_idx].item()]).index_select(
-                            -1, self.orbital_mask[data.atoms[src_idx].item()])
-                        )
-                    else:
-                        mask1 = (src == src_idx)
-                        mask2 = (dst == dst_idx)
-                        index = torch.where(mask1 & mask2)[0].item()
+            node_start = int(data.ptr[graph_idx].item())
+            node_end = int(data.ptr[graph_idx + 1].item())
+            num_nodes = node_end - node_start
+            num_edges = num_nodes * (num_nodes - 1)
 
-                        matrix_col.append(
-                            non_diagonal_matrix[index].index_select(
-                                -2, self.orbital_mask[data.atoms[dst_idx].item()]).index_select(
-                                    -1, self.orbital_mask[data.atoms[src_idx].item()]))
-                matrix_block_col.append(torch.cat(matrix_col, dim=-2))
-            final_matrix.append(torch.cat(matrix_block_col, dim=-1))
+            blocks = torch.zeros(
+                num_nodes,
+                num_nodes,
+                max_block_size,
+                max_block_size,
+                dtype=diagonal_matrix.dtype,
+                device=diagonal_matrix.device,
+            )
+
+            diag_idx = torch.arange(num_nodes, device=diagonal_matrix.device)
+            blocks[diag_idx, diag_idx] = diagonal_matrix[node_start:node_end]
+
+            if num_edges > 0:
+                graph_dst = dst[edge_start:edge_start + num_edges].long() - node_start
+                graph_src = src[edge_start:edge_start + num_edges].long() - node_start
+                blocks[graph_dst, graph_src] = non_diagonal_matrix[edge_start:edge_start + num_edges]
+
+            dense = blocks.permute(0, 2, 1, 3).reshape(
+                num_nodes * max_block_size,
+                num_nodes * max_block_size,
+            )
+            atom_orbitals = []
+            atoms = data.atoms[node_start:node_end].reshape(-1)
+            for atom_idx, atom in enumerate(atoms):
+                atom_orbitals.append(
+                    atom_idx * max_block_size + self.orbital_mask[int(atom.item())].to(diagonal_matrix.device)
+                )
+            atom_orbitals = torch.cat(atom_orbitals, dim=0)
+            final_matrix.append(dense.index_select(0, atom_orbitals).index_select(1, atom_orbitals))
+            edge_start += num_edges
         final_matrix = torch.stack(final_matrix, dim=0)
         return final_matrix
 
