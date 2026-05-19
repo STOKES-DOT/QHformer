@@ -34,6 +34,7 @@ env/
 runs/
 *.log
 training_output*.log
+.mplconfig/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -55,8 +56,6 @@ dataset/
 *.hdf5
 *.h5
 
-# Test outputs
-tests/
 # Allow images in documentation
 !images/*.png
 *.gif

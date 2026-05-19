@@ -1,11 +1,11 @@
 """
 QHformer Training Script
 
-Trains the QHformer model (QHNet with Inner Product Attention) for
+Trains the QHformer model (QHNet with multi-head hybrid CSA/HCA attention) for
 predicting quantum Hamiltonian matrices.
 
 Key Features:
-- Inner Product Attention: Query/Key maintain FULL irreps
+- Multi-head CSA/HCA attention: Query/Key maintain equivariant irreps
 - Rotation-invariant attention via InnerProduct
 - Full equivariance preserved
 
@@ -77,18 +77,25 @@ def scatter_pure(src, index, dim_size=None, dim=0, out=None, reduce='sum', dim_s
     if dim_size is None:
         dim_size = int(index.max().item()) + 1 if index.numel() > 0 else 0
 
+    if index.dim() == 1:
+        index_shape = [1] * src.dim()
+        index_shape[dim] = index.shape[0]
+        index_expanded = index.reshape(index_shape).expand_as(src)
+    else:
+        index_expanded = index
+
     if reduce == 'sum' or reduce == 'add':
         out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, src)
+        return out.scatter_add_(dim, index_expanded, src)
     elif reduce == 'mean':
         out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
         counts = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        out.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, src)
-        counts.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, torch.ones_like(src))
+        out.scatter_add_(dim, index_expanded, src)
+        counts.scatter_add_(dim, index_expanded, torch.ones_like(src))
         return out / (counts.clamp(min=1))
     else:
         out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, src)
+        return out.scatter_add_(dim, index_expanded, src)
 
 
 class FakeTorchCluster:
@@ -131,20 +138,28 @@ class Config:
     max_radius = 12
     radius_embed_dim = 64
 
-    # Inner Product Attention parameters
+    # Hybrid attention parameters
     attention_temperature = 1.0  # Temperature for attention softmax
+    num_heads = 4
+    use_hybrid_attention = True
+    csa_top_k = 8
+    hca_lmax = 3
+    indexer_compress_dim = 32
+    attention_score_residual_init_std = 0.0
 
     # Training parameters
     num_epochs = 15000
-    batch_size = 256  # Modified: batch_size=256
-    learning_rate = 1e-4
+    batch_size = 512
+    learning_rate = 1e-3
     weight_decay = 1e-4
     grad_clip = 0.5
 
-    # Warmup and cosine annealing - Match QHTransformer
+    # Warmup and cosine annealing
     warmup_epochs = 1000  # Match QHTransformer
     warmup_start_lr = 1e-7  # Match QHTransformer
-    min_lr = 1e-6  # Match QHTransformer
+    min_lr = 1e-5
+    lr_drop_epoch = None
+    lr_drop_gamma = 0.1
 
     # Dataset
     dataset_name = 'water'
@@ -153,11 +168,11 @@ class Config:
     test_split = 0.2
 
     # Device
-    device = 'cuda:4'  # Use GPU 4
+    device = 'cuda:0'
     seed = 42
 
     # Logging
-    save_interval = 10  # Visualize every 10 epochs
+    save_interval = 50  # Visualize and checkpoint every 50 epochs
     log_interval = 10
     log_dir = './runs/qhformer_water_full'
 
@@ -214,11 +229,15 @@ def get_lr(epoch, config):
     """Learning rate with warmup and cosine annealing - Match E3-DeepMolH"""
     if epoch <= config.warmup_epochs:
         # Linear warmup from warmup_start_lr to learning_rate
-        return config.warmup_start_lr + (config.learning_rate - config.warmup_start_lr) * epoch / config.warmup_epochs
+        lr = config.warmup_start_lr + (config.learning_rate - config.warmup_start_lr) * epoch / config.warmup_epochs
     else:
         # Cosine annealing from learning_rate to min_lr
         progress = (epoch - config.warmup_epochs) / (config.num_epochs - config.warmup_epochs)
-        return config.min_lr + (config.learning_rate - config.min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
+        lr = config.min_lr + (config.learning_rate - config.min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
+
+    if config.lr_drop_epoch is not None and epoch > config.lr_drop_epoch:
+        lr *= config.lr_drop_gamma
+    return lr
 
 
 def plot_training_curves(history, log_dir, logger, data_fraction=0.01):
@@ -610,6 +629,12 @@ def main():
         max_radius=config.max_radius,
         radius_embed_dim=config.radius_embed_dim,
         attention_temperature=config.attention_temperature,
+        num_heads=config.num_heads,
+        use_hybrid_attention=config.use_hybrid_attention,
+        csa_top_k=config.csa_top_k,
+        hca_lmax=config.hca_lmax,
+        indexer_compress_dim=config.indexer_compress_dim,
+        attention_score_residual_init_std=config.attention_score_residual_init_std,
     ).to(config.device)
 
     # Set device for model-specific tensors
@@ -699,28 +724,25 @@ def main():
             if is_best:
                 logger.info(f"  ✓ New best model saved at epoch {epoch}")
 
-        # Visualization every save_interval epochs (matching QHNet style)
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': vars(config),
+            'history': history,
+            'best_val_mae': best_val_mae,
+            'best_epoch': best_epoch,
+        }
+
+        if is_best:
+            torch.save(checkpoint, log_dir / 'best_checkpoint.pth')
+            logger.info(f"New best model at epoch {epoch} (MAE: {best_val_mae:.6f})")
+
+        # Visualization and latest checkpoint every save_interval epochs.
         if epoch % config.save_interval == 0 or epoch == config.num_epochs:
             visualize_predictions(model, train_loader, test_loader, config.device, log_dir, epoch, logger)
-
-        if epoch % config.save_interval == 0 or is_best:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': vars(config),
-                'history': history,
-                'best_val_mae': best_val_mae,
-                'best_epoch': best_epoch,
-            }
             torch.save(checkpoint, log_dir / 'latest_checkpoint.pth')
-
-            # Plot training curves
             plot_training_curves(history, log_dir, logger, config.data_fraction)
-
-            if is_best:
-                torch.save(checkpoint, log_dir / 'best_checkpoint.pth')
-                logger.info(f"New best model at epoch {epoch} (MAE: {best_val_mae:.6f})")
 
     logger.info("")
     logger.info("Training completed!")

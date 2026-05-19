@@ -1,349 +1,379 @@
-# QHformer: SO(3)-Equivariant Hamiltonian Prediction with Inner Product Attention
+# QHformer v2: SO(3)-Equivariant Hamiltonian Prediction with Hybrid Multi-Head Attention
 
-A novel neural network architecture for predicting quantum Hamiltonian matrices from molecular geometries using SO(3)-equivariant graph neural networks with Inner Product Attention mechanism.
+QHformer predicts quantum Hamiltonian matrices from molecular geometries with SO(3)-equivariant graph neural networks. The `qhformer-v2` branch replaces the legacy single-head inner-product attention stack with a 4-head hybrid attention backbone:
 
-## 🌟 Key Innovation
+- **Multi-head inner-product attention** with head splitting only along irrep multiplicity axes.
+- **CSA (Compressed Sparse Attention)** layers with invariant indexer scoring and per-destination top-k edge selection.
+- **HCA (Heavy Compressed Attention)** layers with low-order K/V compression while keeping full-irrep Q.
+- **CSA-HCA-CSA-HCA** alternating pattern across the default 4 GNN layers.
+- **Identity-initialized NormGate and attention residuals** so random-parameter models preserve non-scalar equivariant channels instead of collapsing to invariants.
 
-### Inner Product Attention
+The CSA/HCA naming and alternating sparse/compressed attention layout are inspired by the DeepSeek-V4 hybrid attention architecture. QHformer v2 adapts that idea to SO(3)-equivariant molecular graphs: compression and sparsity are applied to equivariant edge attention and K/V irreps rather than to transformer token KV caches.
 
-QHformer introduces **Inner Product Attention** that preserves complete irreducible representations throughout the attention computation, unlike traditional methods that compress Query/Key to scalars.
+The old single-head attention path is intentionally not retained in this branch.
 
-**Mathematical Foundation:**
+## Key Ideas
 
-$$
-\begin{aligned}
-\text{Query: } & q_i = \text{Linear}(h_i) \rightarrow \text{Full Irreps (no compression)} \\
-\text{Key: } & k_{ij} = \text{TP}(h_j, Y(\mathbf{r}_{ij})) \rightarrow \text{Full Irreps} \\
-\text{Value: } & v_{ij} = \text{TP}(h_j, Y(\mathbf{r}_{ij})) \rightarrow \text{Hidden Irreps} \\
-\text{Attention: } & \alpha_{ij} = \text{softmax}(\langle q_i, k_{ij} \rangle_l / \sqrt{d}) \\
-\text{Update: } & h_i' = h_i + \sum_j \alpha_{ij} \cdot v_{ij}
-\end{aligned}
-$$
+### Hamiltonian Equivariance
 
-**Theorem (Rotation Invariance):**
+For a molecular rotation \(R\), the Hamiltonian is not expected to remain elementwise invariant. In a real atomic-orbital basis it should transform as:
 
-For features $x, y \in V^l$ in the same irreducible representation:
+\[
+H(RX) = U(R) H(X) U(R)^T
+\]
 
-$$ \langle R \cdot x, R \cdot y \rangle_l = \langle x, y \rangle_l \quad \forall R \in \text{SO}(3) $$
+where \(U(R)\) is the block Wigner-D representation induced by the basis orbitals. Therefore:
 
-This guarantees that attention scores are invariant to molecular rotations.
+- Matrix entries can and should change under rotation.
+- Trace and eigenvalues should remain invariant.
+- Elementwise invariance under rotation is a failure mode for Hamiltonian prediction.
 
-## 🏗️ Architecture
+### Multi-Head Inner Product Attention
 
+The branch keeps the invariant attention score construction from inner products of matching irreps, but computes it per head. For an irrep block such as:
+
+\[
+128x0e + 128x1o + 128x2e + 128x3o + 128x4e
+\]
+
+with `num_heads=4`, each multiplicity is split into 4 groups:
+
+\[
+32x0e + 32x1o + 32x2e + 32x3o + 32x4e
+\]
+
+The split never cuts across the \(2l+1\) irrep dimension.
+
+### Hybrid CSA/HCA Backbone
+
+The hybrid layer design follows the same high-level separation used in DeepSeek-V4:
+
+- CSA: moderately compressed attention plus learned sparse selection.
+- HCA: heavier K/V compression with a cheaper dense attention path over compressed carriers.
+
+In this repository those ideas are reinterpreted for molecular graphs and irreducible representations, so all scoring inputs remain rotation-invariant and all value carriers remain equivariant.
+
+Default layer pattern:
+
+```text
+Layer 0: CSA
+Layer 1: HCA
+Layer 2: CSA
+Layer 3: HCA
 ```
-Input:  Molecular Geometry (𝐫_i, z_i)
-           ↓
-Node Embedding → h_i^(0)
-           ↓
-GNN Layers (×num_gnn_layers)
-  ├─ 1. Query Projection
-  ├─ 2. Key TP with Edge SH
-  ├─ 3. Inner Product Attention
-  ├─ 4. Value TP + Aggregation
-  └─ 5. Feed-forward Network
-           ↓
-Hamiltonian Block → H ∈ ℝ^(n_orb × n_orb)
-           ↓
-Output:  Hamiltonian Matrix
+
+CSA computes a cheap invariant indexer score on all graph edges, selects top-k incoming edges per destination node, then computes expensive K/V tensor products only on selected edges.
+
+HCA keeps full-irrep queries but compresses K/V to low angular order:
+
+```text
+Q: full l = 0..4
+K/V: l <= hca_lmax
 ```
 
-## 📁 Project Structure
+After HCA aggregation, missing high-order value channels are zero-padded before the output projection. This is an architectural compression, not a clamp on equivariant features.
 
-```
+## Project Structure
+
+```text
 QHformer/
 ├── models/
-│   ├── __init__.py                    # Package initialization
-│   ├── inner_product_attention.py     # Inner Product Attention layer
+│   ├── __init__.py
+│   ├── inner_product_attention.py     # Multi-head, CSA, HCA attention layers
 │   └── qhformer.py                    # Main QHformer model
+├── scripts/
+│   └── generate_equivariance_panels.py # README equivariance figure generator
 ├── training/
-│   ├── train_qhformer.py              # Training script
-│   └── monitor_training.sh            # Training monitor script
+│   ├── train_qhformer.py              # MD17/SchNOrb water training entrypoint
+│   ├── measure_water_memory.py        # CUDA memory measurement utility
+│   └── monitor_training.sh
+├── tests/
+│   └── test_hybrid_equivariance.py    # Hybrid attention equivariance checks
 ├── utils/
-│   ├── data_utils.py                  # Data loading utilities
-│   └── ori_dataset.py                 # Original dataset wrapper
-├── requirements.txt                    # Python dependencies
-└── README.md                           # This file
+│   ├── data_utils.py
+│   └── ori_dataset.py
+├── images/
+│   └── equivariance/
+│       ├── h_original.png
+│       ├── h_rotated.png
+│       ├── h_delta_abs.png
+│       └── spectrum_invariance.png
+└── README.md
 ```
 
-## 🚀 Installation
+## Installation
 
-### Requirements
-
-- Python >= 3.8
-- PyTorch >= 1.12
-- e3nn >= 0.5.0
-- PyTorch Geometric
-
-### Install Dependencies
+The project depends on PyTorch, PyTorch Geometric, e3nn, and the PyG CUDA extensions used by the original QHformer/QHNet code path.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Or manually:
+The remote training run in this branch used:
 
 ```bash
-pip install torch torchvision torchaudio
-pip install e3nn pytorch-scatter pytorch-sparse
-pip install torch-geometric
-pip install numpy scipy matplotlib
+/home/yjiao/opt/miniconda3/envs/deeepmolh_e3/bin/python
 ```
 
-## 💻 Usage
+## Usage
 
-### Training
-
-Basic training:
-```bash
-cd training
-python train_qhformer.py
-```
-
-With custom hyperparameters:
-```python
-python train_qhformer.py \
-    --dataset_path /path/to/md17_water.npz \
-    --hidden_size 256 \
-    --num_gnn_layers 5 \
-    --learning_rate 1e-4 \
-    --epochs 15000
-```
-
-### Using the Model
+### Instantiate QHformer v2
 
 ```python
 from models.qhformer import QHformer
 
-# Initialize model
 model = QHformer(
-    in_node_features=1,           # Atomic number
-    sh_lmax=4,                    # Max spherical harmonic degree
-    hidden_size=256,              # Hidden dimension
-    bottle_hidden_size=64,        # Bottleneck dimension
-    num_gnn_layers=5,             # Number of GNN layers
-    max_radius=12.0,              # Cutoff radius (Å)
-    radius_embed_dim=64,          # Radius embedding dimension
-    attention_temperature=1.0,    # Attention temperature
+    in_node_features=4,
+    sh_lmax=4,
+    hidden_size=256,
+    bottle_hidden_size=64,
+    num_gnn_layers=4,
+    max_radius=12,
+    num_nodes=10,
+    radius_embed_dim=64,
+    attention_temperature=1.0,
+    num_heads=4,
+    use_hybrid_attention=True,
+    csa_top_k=8,
+    hca_lmax=3,
+    indexer_compress_dim=32,
+    attention_score_residual_init_std=0.0,
 )
 
-# Forward pass
 outputs = model(batch_data)
-hamiltonian = outputs['hamiltonian']  # Shape: (batch, n_orb, n_orb)
+hamiltonian = outputs["hamiltonian"]
 ```
 
-### Model Parameters
+Set `use_hybrid_attention=False` to run all layers as dense multi-head inner-product attention.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `in_node_features` | 1 | Input node feature dimension (atomic number) |
-| `sh_lmax` | 4 | Maximum degree of spherical harmonics |
-| `hidden_size` | 256 | Hidden feature dimension |
-| `bottle_hidden_size` | 64 | Bottleneck dimension |
-| `num_gnn_layers` | 5 | Number of GNN layers |
-| `max_radius` | 12.0 | Maximum neighbor radius (Å) |
-| `radius_embed_dim` | 64 | Radial basis embedding dimension |
-| `attention_temperature` | 1.0 | Temperature for attention softmax |
+## Architecture
 
-## 🔬 Theoretical Background
+### GNN Layer Stack
 
-### SO(3) Equivariance
+```text
+Molecular graph
+  ├─ atomic embedding: Z -> hidden scalar irreps
+  ├─ spherical harmonics: edge vectors -> Y_lm(r_ij), l = 0..4
+  └─ radial embedding: |r_ij| -> Bernstein RBF
 
-A function $f: \mathbb{R}^{3N} \times \mathbb{Z}^N \rightarrow V^{l_{\text{out}}}$ is SO(3)-equivariant if:
+GNN layer 0: CSA multi-head inner-product attention
+GNN layer 1: HCA multi-head inner-product attention
+GNN layer 2: CSA multi-head inner-product attention
+GNN layer 3: HCA multi-head inner-product attention
 
-$$ f(\{R \cdot \mathbf{r}_i, z_i\}_{i=1}^N) = D^{l_{\text{out}}}(R) \cdot f(\{\mathbf{r}_i, z_i\}_{i=1}^N) \quad \forall R \in \text{SO}(3) $$
+SelfNet / PairNet
+  └─ equivariant node and pair features
 
-For Hamiltonian prediction:
-
-$$ H_{\mu\nu}(\{R \cdot \mathbf{r}_i\}) = \sum_{\mu',\nu'} D(R)_{\mu\mu'} D(R)_{\nu\nu'} H_{\mu'\nu'}(\{\mathbf{r}_i\}) $$
-
-### Inner Product Invariance Proof
-
-For irreps $V^l$ with Wigner D-matrices $D^l(R)$:
-
-$$
-\begin{aligned}
-\langle R \cdot x, R \cdot y \rangle_l &= \sum_{m=-l}^{l} (R \cdot x)_m (R \cdot y)_m \\
-&= \sum_{m=-l}^{l} \left[ \sum_{m'=-l}^{l} D^l_{mm'}(R) x_{m'} \right] \left[ \sum_{m''=-l}^{l} D^l_{mm''}(R) y_{m''} \right] \\
-&= \sum_{m',m''=-l}^{l} x_{m'} y_{m''} \sum_{m=-l}^{l} D^l_{mm'}(R) D^l_{mm''}(R) \\
-&= \sum_{m',m''=-l}^{l} x_{m'} y_{m''} \delta_{m'm''} \quad \text{(orthogonality)} \\
-&= \sum_{m=-l}^{l} x_m y_m \\
-&= \langle x, y \rangle_l \quad \checkmark
-\end{aligned}
-$$
-
-### Tensor Product
-
-The tensor product of two irreps decomposes as a direct sum:
-
-$$ V^{l_1} \otimes V^{l_2} = \bigoplus_{L=|l_1-l_2|}^{l_1+l_2} V^L $$
-
-**Example**:
-
-$$ V^1_o \otimes V^1_o = V^0_e \oplus V^1_o \oplus V^2_e $$
-
-Using Clebsch-Gordan coefficients $C_{l_1,m_1,l_2m_2}^{l_3m_3}$:
-
-$$\nu_1^{l_1}\otimes\nu_1^{l_1}=\sum_{m_1=-l_1}^{l_1}\sum_{m_2=-l_2}^{l_2}C_{l_1,m_1,l_2m_2}^{l_3m_3}\nu_{1m_1}^{l_1}\nu_{2m_2}^{l_2}$$
-
-**Selection Rules**:
-- $M = m_1 + m_2$ (magnetic quantum number conservation)
-- $|l_1 - l_2| \leq L \leq l_1 + l_2$ (triangle inequality)
-- $l_1 + l_2 + L$ is even (for real spherical harmonics)
-
-## 📈 Training Configuration
-
-### Recommended Hyperparameters
-
-```python
-training_config = {
-    # Architecture
-    'hidden_size': 256,
-    'bottle_hidden_size': 64,
-    'num_gnn_layers': 5,
-    'sh_lmax': 4,
-    'max_radius': 12.0,
-
-    # Training
-    'learning_rate': 1e-4,
-    'batch_size': 256,
-    'epochs': 15000,
-    'warmup_epochs': 1000,
-    'weight_decay': 1e-4,
-    'gradient_clipping': 0.5,
-
-    # Learning rate schedule
-    'min_lr': 1e-6,
-    'scheduler': 'cosine_annealing',
-}
+Expansion
+  └─ AO block tensors -> assembled Hamiltonian matrix
 ```
 
-### Dataset Format
+The attention stack produces equivariant node features. The QHNet-style expansion modules then convert equivariant node and pair features into diagonal and off-diagonal atomic-orbital Hamiltonian blocks.
 
-The model expects molecular data in the following format:
+### Multi-Head Split/Merge
 
-```python
-{
-    'pos': Tensor[N, 3],           # Atomic positions (Å)
-    'z': Tensor[N],                # Atomic numbers
-    'hamiltonian': Tensor[M, M],   # Hamiltonian matrix
-    'edge_index': Tensor[2, E],    # Graph connectivity
-}
+`split_irreps_multiplicity(x, irreps, num_heads)` rewrites flat irrep tensors from `[N, D]` to `[N, H, D_head]` by splitting only the multiplicity of each irrep block:
+
+```text
+[N, mul * (2l + 1)]
+  -> [N, num_heads, mul / num_heads, 2l + 1]
+  -> [N, num_heads, D_l_head]
 ```
 
-## ✅ Advantages of Inner Product Attention
+`merge_heads` performs the exact inverse. This is the key mechanical constraint for preserving SO(3) structure in the multi-head implementation.
 
-1. **Maximum Information Preservation**
-   - Query and Key maintain full irreps
-   - No information loss before attention
-   - All (l, m) components participate
+### Attention Score Path
 
-2. **Mathematical Elegance**
-   - Built-in rotation invariance
-   - Guaranteed by inner product structure
-   - No handcrafted equivariance enforcement
+For each head, `MultiHeadInnerProduct` computes invariant channels by taking inner products between matching Q/K irreps:
 
-3. **Computational Efficiency**
-   - Direct inner product computation
-   - No complex tensor decomposition
-   - Fewer parameters than projection-based methods
+```text
+Q_i^h, K_ij^h -> invariant channels [E, num_invariants, num_heads]
+```
 
-4. **Strong Expressiveness**
-   - Upper bound on representational capacity
-   - Theoretical foundation in representation theory
-   - Optimal for high-precision tasks
+`InvariantAttentionScore` then maps these invariant channels to logits. Its residual scorer is initialized to exactly zero by default:
 
-## 🧪 Experimental Results
+```text
+logits = sum(invariant_channels) + residual_scorer(invariant_channels)
+```
 
-### MD17 Water Molecule
+At initialization this matches the old inner-product sum, while still allowing training to learn nonuniform invariant-channel combinations.
 
-| Metric | Value |
-|--------|-------|
-| Molecule | H₂O |
-| Orbitals | 24 (def2-SVP) |
-| Hamiltonian Size | 24 × 24 |
-| Training Samples | 3,999 |
-| Validation Samples | 1,000 |
-| Total Epochs | 15,000 |
-| Best Val MAE | $1.2 \times 10^{-5}$ Hartree (epoch 14950) |
-| Final Val MAE | $1.3 \times 10^{-5}$ Hartree |
-| Training Time | ~5 days (CUDA) |
-| Equivariance | Verified ✓ |
+### CSA Layer
 
-### Training Performance
+CSA uses a cheap invariant indexer before expensive tensor-product K/V construction:
 
-The model achieved excellent convergence with no overfitting:
+```text
+all edges
+  -> scalar indexer score from node scalar features + radial embedding
+  -> top-k incoming edges per destination node
+  -> K/V tensor products only on selected edges
+  -> multi-head inner-product attention
+  -> head merge and output projection
+```
 
-- **Rapid initial convergence**: MAE dropped from 0.25 to $10^{-4}$ Hartree in first 100 epochs
-- **Stable optimization**: Consistent improvement over 15,000 epochs
-- **No overfitting**: Training and validation MAE track closely
-- **Best performance**: $1.2 \times 10^{-5}$ Hartree MAE on validation set
+This reduces K/V tensor-product work and attention memory when molecular graphs have many edges.
 
-![Training Curves](images/training_curves.png)
+### HCA Layer
 
-### Prediction Quality
+HCA keeps query features full-rank but compresses K/V to low angular order:
 
-The model achieves high-accuracy Hamiltonian prediction:
+```text
+Q_i:   l = 0..4
+K_ij:  l <= hca_lmax
+V_ij:  l <= hca_lmax
+```
 
-![Validation Predictions](images/predictions_val.png)
+After aggregation, omitted high-order value channels are padded with zeros before the output projection. The query still sees the full directional state; the compression only limits the key/value carrier used by that layer.
 
-### Error Distribution
+### NormGate and Residuals
 
-Prediction errors are concentrated around zero with minimal outliers:
+`NormGate` is identity-initialized:
 
-![Error Distribution](images/error_distribution.png)
+```text
+scalar_out     = scalar_x + residual_scalar
+non_scalar_out = non_scalar_x * (1 + residual_gate)
+```
 
-## 🔧 Troubleshooting
+with the last gate layer initialized to zero. Attention layer residuals use the original layer input, not the gated/projection intermediate. These two details avoid the failure mode where random-parameter GNN features collapse to scalar invariants.
 
-### Common Issues
+## Training Entry Point
 
-**Issue**: `CUDA out of memory`
-- **Solution**: Reduce `batch_size` or `hidden_size`
+Default water configuration in `training/train_qhformer.py`:
 
-**Issue**: `Poor convergence`
-- **Solution**: Lower `learning_rate` to 1e-5, increase `warmup_epochs`
+| Parameter | Default |
+|-----------|---------|
+| `hidden_size` | 256 |
+| `bottle_hidden_size` | 64 |
+| `num_gnn_layers` | 4 |
+| `num_heads` | 4 |
+| `use_hybrid_attention` | `True` |
+| `csa_top_k` | 8 |
+| `hca_lmax` | 3 |
+| `indexer_compress_dim` | 32 |
+| `attention_score_residual_init_std` | 0.0 |
+| `batch_size` | 512 |
+| `num_epochs` | 15000 |
+| `learning_rate` | 1e-3 |
+| `warmup_start_lr` | 1e-7 |
+| `warmup_epochs` | 1000 |
+| `min_lr` | 1e-5 |
+| `train_split` / `test_split` | 0.8 / 0.2 |
+| `save_interval` | 50 epochs |
 
-**Issue**: `Equivariance violation`
-- **Solution**: Check tensor product implementation, verify Clebsch-Gordan coefficients
+Run:
 
-## 📚 References
+```bash
+python training/train_qhformer.py
+```
 
-1. **QHNet**: [Divel-DiNISR/QHNet](https://github.com/Divel-DiNISR/QHNet) - Original Hamiltonian prediction network
-2. **e3nn**: [e3nn documentation](https://docs.e3nn.org/) - Equivariant neural networks
-3. **Equiformer**: [EquiformerV2](https://github.com/atomicarchitects/equiformer_v2) - SO(2) convolution attention
-4. **Clebsch-Gordan**: [CG coefficients](https://en.wikipedia.org/wiki/Clebsch%E2%80%93Gordan_coefficients) - Angular momentum coupling
+The loss keeps the previous form:
 
-## 👤 Author
+\[
+\mathcal{L} = \mathrm{MAE}(H, \hat{H}) + \mathrm{MSE}(H, \hat{H})
+\]
+
+MAE is used as the primary reporting metric.
+
+### Measure Per-Molecule Memory
+
+```bash
+python training/measure_water_memory.py \
+  --data-root /home/yjiao/QHformer/dataset \
+  --molecule water \
+  --device cuda:0 \
+  --batch-sizes 128,256,512 \
+  --hca-lmax 3
+```
+
+## Verification
+
+Run the hybrid equivariance tests:
+
+```bash
+python -m pytest tests/test_hybrid_equivariance.py -q
+```
+
+The test coverage checks:
+
+- irrep multiplicity split/merge round trip,
+- invariant attention scorer zero-residual initialization,
+- optional nonzero scorer residual initialization,
+- identity initialization of `NormGate`,
+- CSA/HCA/multi-head forward finite output,
+- CSA-HCA-CSA-HCA construction in `QHformer`,
+- Hamiltonian trace/eigenvalue invariance under random water rotations.
+
+Latest local verification:
+
+```text
+11 passed
+```
+
+A random-parameter water rotation diagnostic after the NormGate/residual fix showed non-invariant matrix entries with invariant spectrum:
+
+```text
+max |H(RX) - H(X)| = 4.24e-1
+mean |H(RX) - H(X)| = 3.38e-2
+max eigenvalue diff = 1.91e-6
+trace diff = 1.91e-6
+```
+
+### README Equivariance Panels
+
+Generate the standalone documentation panels with:
+
+```bash
+python scripts/generate_equivariance_panels.py
+```
+
+The panels use a randomly initialized small QHformer v2 on one water molecule. They are architecture/equivariance diagnostics, not training results.
+
+| Original orientation | Rotated orientation |
+|---|---|
+| ![H original](images/equivariance/h_original.png) | ![H rotated](images/equivariance/h_rotated.png) |
+
+| Elementwise matrix change | Spectrum invariance |
+|---|---|
+| ![Hamiltonian elementwise delta](images/equivariance/h_delta_abs.png) | ![Hamiltonian spectrum invariance](images/equivariance/spectrum_invariance.png) |
+
+## Implementation Notes
+
+- Attention softmax includes a NaN fallback to uniform weights.
+- Scorer residual weights are initialized to exactly zero by default, so the initial score equals the original invariant inner-product sum.
+- `attention_score_residual_init_std` can be set nonzero for experiments; this preserves equivariance because it mixes invariant channels only.
+- HCA zero-padding uses zeros for omitted high-order channels and does not clamp non-scalar features.
+- `NormGate` is identity-initialized to avoid suppressing directional channels at initialization.
+- The H/He/light first-row orbital mask uses `[0, 1, 3, 4, 5]`; O and heavier atoms use the full 14-orbital mask, giving a 24 x 24 H2O Hamiltonian.
+
+## References
+
+1. QHNet: [Divel-DiNISR/QHNet](https://github.com/Divel-DiNISR/QHNet)
+2. DeepSeek-V4: [Technical report](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/DeepSeek_V4.pdf) and [Transformers model documentation](https://huggingface.co/docs/transformers/main/model_doc/deepseek_v4)
+3. e3nn: [e3nn documentation](https://docs.e3nn.org/)
+4. EquiformerV2: [atomicarchitects/equiformer_v2](https://github.com/atomicarchitects/equiformer_v2)
+5. DeepH-2: [mzjb/DeepH-pack](https://github.com/mzjb/DeepH-pack)
+
+## Author
 
 **Yuan Jiao (焦源)**
+
 - GitHub: [STOKES-DOT](https://github.com/STOKES-DOT)
 - Email: jiaoyuan24@mails.ucas.ac.cn
 - ORCID: [0009-0006-9418-5545](https://orcid.org/0009-0006-9418-5545)
 - Institution: University of Chinese Academy of Sciences (UCAS)
 
-## 📄 License
+## License
 
-MIT License - see LICENSE file for details
+MIT License - see LICENSE file for details.
 
-## 🙏 Acknowledgments
-
-- Developed for quantum chemistry research at UCAS
-- Built upon e3nn and PyTorch Geometric
-- Inspired by advances in equivariant deep learning
-
-## ⭐ Citation
-
-If you find QHformer useful for your research, please cite:
+## Citation
 
 ```bibtex
 @software{jiao2026qhformer,
-  title={QHformer: SO(3)-Equivariant Hamiltonian Prediction with Inner Product Attention},
+  title={QHformer: SO(3)-Equivariant Hamiltonian Prediction with Hybrid Multi-Head Attention},
   author={Jiao, Yuan},
   year={2026},
   url={https://github.com/STOKES-DOT/QHformer},
   institution={University of Chinese Academy of Sciences}
 }
 ```
-
----
-
-**Made with ❤️ for the computational chemistry community**

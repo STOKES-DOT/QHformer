@@ -29,7 +29,9 @@ except ImportError:
 # Handle both relative and absolute imports
 try:
     from .inner_product_attention import (
-        InnerProductAttentionNetLayer,
+        MultiHeadAttentionNetLayer,
+        CompressedSparseAttentionNetLayer,
+        HeavyCompressedAttentionNetLayer,
         get_feasible_irrep,
         InnerProduct,
         NormGate,
@@ -38,7 +40,9 @@ try:
     )
 except ImportError:
     from inner_product_attention import (
-        InnerProductAttentionNetLayer,
+        MultiHeadAttentionNetLayer,
+        CompressedSparseAttentionNetLayer,
+        HeavyCompressedAttentionNetLayer,
         get_feasible_irrep,
         InnerProduct,
         NormGate,
@@ -413,7 +417,7 @@ class QHformer(nn.Module):
     Architecture:
         1. Graph construction with spherical harmonics
         2. Node embedding
-        3. InnerProductAttentionLayer (core innovation)
+        3. CSA/HCA multi-head inner-product attention layers
         4. SelfNet and PairNet (same as original QHNet)
         5. Expansion to Hamiltonian blocks
         6. Matrix assembly and symmetrization
@@ -434,6 +438,12 @@ class QHformer(nn.Module):
         num_nodes: Maximum number of atoms (default: 10)
         radius_embed_dim: Radial basis embedding dimension (default: 32)
         attention_temperature: Temperature for attention (default: 1.0)
+        num_heads: Number of multiplicity-split attention heads (default: 4)
+        use_hybrid_attention: Use CSA-HCA-CSA-HCA alternation when True
+        csa_top_k: Max incoming edges per node in CSA layers
+        hca_lmax: Maximum angular degree retained in HCA K/V compression
+        indexer_compress_dim: Hidden dimension of CSA Lightning Indexer
+        attention_score_residual_init_std: Std for nonzero learnable attention-score residual init.
     """
 
     def __init__(
@@ -447,6 +457,12 @@ class QHformer(nn.Module):
         num_nodes=10,
         radius_embed_dim=32,
         attention_temperature=1.0,
+        num_heads=4,
+        use_hybrid_attention=True,
+        csa_top_k=8,
+        hca_lmax=2,
+        indexer_compress_dim=32,
+        attention_score_residual_init_std=0.0,
     ):
         super(QHformer, self).__init__()
         self.order = sh_lmax
@@ -457,6 +473,12 @@ class QHformer(nn.Module):
         self.radius_embed_dim = radius_embed_dim
         self.max_radius = max_radius
         self.num_gnn_layers = num_gnn_layers
+        self.num_heads = num_heads
+        self.use_hybrid_attention = use_hybrid_attention
+        self.csa_top_k = csa_top_k
+        self.hca_lmax = hca_lmax
+        self.indexer_compress_dim = indexer_compress_dim
+        self.attention_score_residual_init_std = attention_score_residual_init_std
 
         # Use atomic number embedding (max Z=118 for periodic table)
         self.node_embedding = nn.Embedding(118, self.hs)
@@ -474,9 +496,15 @@ class QHformer(nn.Module):
         self.num_fc_layer = 1
         self.start_layer = 2
 
-        # ============ Inner Product Attention Layers ============
-        print(f"QHformer initialized with Inner Product Attention:")
+        # ============ Multi-Head CSA/HCA Attention Layers ============
+        print(f"QHformer initialized with Multi-Head {'Hybrid CSA/HCA' if use_hybrid_attention else 'Dense'} Attention:")
         print(f"  attention_temperature = {attention_temperature}")
+        print(f"  num_heads = {num_heads}")
+        if use_hybrid_attention:
+            print(f"  pattern = CSA-HCA-CSA-HCA")
+            print(f"  csa_top_k = {csa_top_k}")
+            print(f"  hca_lmax = {hca_lmax}")
+        print(f"  attention_score_residual_init_std = {attention_score_residual_init_std}")
         print(f"  Query/Key irreps = {self.hidden_irrep}")
 
         self.e3_gnn_layer = nn.ModuleList()
@@ -486,18 +514,53 @@ class QHformer(nn.Module):
         for i in range(self.num_gnn_layers):
             input_irrep = self.input_irrep if i == 0 else self.hidden_irrep
 
-            # Use InnerProductAttentionLayer instead of standard ConvLayer
-            self.e3_gnn_layer.append(InnerProductAttentionNetLayer(
-                irrep_in_node=input_irrep,
-                irrep_hidden=self.hidden_irrep,
-                irrep_out=self.hidden_irrep,
-                edge_attr_dim=self.radius_embed_dim,
-                node_attr_dim=self.hs,
-                sh_irrep=self.sh_irrep,
-                resnet=True,
-                use_norm_gate=True if i != 0 else False,
-                attention_temperature=attention_temperature,
-            ))
+            if use_hybrid_attention:
+                if i % 2 == 0:
+                    layer = CompressedSparseAttentionNetLayer(
+                        irrep_in_node=input_irrep,
+                        irrep_hidden=self.hidden_irrep,
+                        irrep_out=self.hidden_irrep,
+                        edge_attr_dim=self.radius_embed_dim,
+                        node_attr_dim=self.hs,
+                        sh_irrep=self.sh_irrep,
+                        resnet=True,
+                        use_norm_gate=True if i != 0 else False,
+                        attention_temperature=attention_temperature,
+                        num_heads=num_heads,
+                        top_k=csa_top_k,
+                        indexer_compress_dim=indexer_compress_dim,
+                        attention_score_residual_init_std=attention_score_residual_init_std,
+                    )
+                else:
+                    layer = HeavyCompressedAttentionNetLayer(
+                        irrep_in_node=input_irrep,
+                        irrep_hidden=self.hidden_irrep,
+                        irrep_out=self.hidden_irrep,
+                        edge_attr_dim=self.radius_embed_dim,
+                        node_attr_dim=self.hs,
+                        sh_irrep=self.sh_irrep,
+                        resnet=True,
+                        use_norm_gate=True if i != 0 else False,
+                        attention_temperature=attention_temperature,
+                        num_heads=num_heads,
+                        hca_lmax=hca_lmax,
+                        attention_score_residual_init_std=attention_score_residual_init_std,
+                    )
+            else:
+                layer = MultiHeadAttentionNetLayer(
+                    irrep_in_node=input_irrep,
+                    irrep_hidden=self.hidden_irrep,
+                    irrep_out=self.hidden_irrep,
+                    edge_attr_dim=self.radius_embed_dim,
+                    node_attr_dim=self.hs,
+                    sh_irrep=self.sh_irrep,
+                    resnet=True,
+                    use_norm_gate=True if i != 0 else False,
+                    attention_temperature=attention_temperature,
+                    num_heads=num_heads,
+                    attention_score_residual_init_std=attention_score_residual_init_std,
+                )
+            self.e3_gnn_layer.append(layer)
 
             if i > self.start_layer:
                 self.e3_gnn_node_layer.append(SelfNetLayer(
@@ -724,9 +787,7 @@ class QHformer(nn.Module):
         return final_matrix
 
     def get_orbital_mask(self):
-        """Get orbital mask for different atom types
-
-        CRITICAL: Must select COMPLETE irreducible representations for SE(3) equivariance!
+        """Get orbital mask for different atom types matching MD17 SchNOrb.
 
         Expansion output: 3x0e + 2x1e + 1x2e (14 orbitals per atom)
         - 3x0e: s-orbitals at indices [0, 1, 2]
@@ -735,29 +796,18 @@ class QHformer(nn.Module):
           * Second p-orbital: [6, 7, 8] (1x1e)
         - 1x2e: d-orbitals at indices [9, 10, 11, 12, 13]
 
-        For proper equivariance, we must select complete multiplets:
-        - For H (Z=1): 1s only → [0] (1x0e)
-        - For He (Z=2): 1s2s → [0, 1] (2x0e)
-        - For Li-Be (Z=3,4): 1s2s + 2p → [0, 1] + [3, 4, 5] = [0, 1, 3, 4, 5] (2x0e + 1x1e)
-        - For B+ (Z=5+): all 14 orbitals
+        MD17/SchNOrb uses H as ``ssp`` after hamiltonian_transform:
+        2 scalar orbitals + one complete p multiplet = 5 orbitals.
+        Complete multiplets are kept to preserve SO(3) equivariance.
         """
-        # For H (Z=1): 1s orbital only (1x0e - complete)
-        orbital_mask_h = torch.tensor([0])
-
-        # For He (Z=2): 1s + 2s (2x0e - complete)
-        orbital_mask_he = torch.tensor([0, 1])
-
-        # For Li-Be (Z=3-4): 1s + 2s + 2p minimal basis (2x0e + 1x1e - complete)
-        orbital_mask_light = torch.cat([torch.tensor([0, 1]), torch.tensor([3, 4, 5])])
-
-        # For B+ (Z=5+): full valence basis (3x0e + 2x1e + 1x2e - complete)
+        orbital_mask_line1 = torch.cat([torch.tensor([0, 1]), torch.tensor([3, 4, 5])])
         orbital_mask_full = torch.arange(14)
 
         orbital_mask = {}
-        orbital_mask[1] = orbital_mask_h  # H: 1s
-        orbital_mask[2] = orbital_mask_he  # He: 1s2s
-        orbital_mask[3] = orbital_mask_light  # Li: 1s2s2p
-        orbital_mask[4] = orbital_mask_light  # Be: 1s2s2p
+        orbital_mask[1] = orbital_mask_line1  # H: ssp
+        orbital_mask[2] = orbital_mask_line1  # He/light first-row fallback
+        orbital_mask[3] = orbital_mask_full
+        orbital_mask[4] = orbital_mask_full
         orbital_mask[5] = orbital_mask_full  # B+: all
         orbital_mask[6] = orbital_mask_full  # C: all
         orbital_mask[7] = orbital_mask_full  # N: all
