@@ -945,19 +945,20 @@ class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
         self.query_norm = MultiHeadEquivariantNorm(self.hca_key_irrep, self.num_heads)
         self.key_norm = MultiHeadEquivariantNorm(self.irrep_tp_key, self.num_heads)
 
-        num_mul = sum(mul for mul, _ in self.irrep_in_node)
-        s0_dim = num_mul + self.irrep_in_node[0][0]
-        scorer_in_dim = s0_dim + self.edge_attr_dim
-        self.indexer = nn.Sequential(
-            nn.Linear(scorer_in_dim, indexer_compress_dim),
-            nn.SiLU(),
-            nn.Linear(indexer_compress_dim, 1),
-        )
         self._init_weights()
-        for module in self.indexer:
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.001)
-                nn.init.zeros_(module.bias)
+        if self.top_k is not None and self.top_k > 0:
+            num_mul = sum(mul for mul, _ in self.irrep_in_node)
+            s0_dim = num_mul + self.irrep_in_node[0][0]
+            scorer_in_dim = s0_dim + self.edge_attr_dim
+            self.indexer = nn.Sequential(
+                nn.Linear(scorer_in_dim, indexer_compress_dim),
+                nn.SiLU(),
+                nn.Linear(indexer_compress_dim, 1),
+            )
+            for module in self.indexer:
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=0.001)
+                    nn.init.zeros_(module.bias)
 
     def forward(self, data, x):
         edge_dst, edge_src = data.edge_index[0], data.edge_index[1]
@@ -969,19 +970,29 @@ class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
             x = self.linear_node(x)
 
         s0_full = self._compute_s0(x, edge_dst, edge_src)
-        relevance = self.indexer(torch.cat([s0_full, data.edge_attr], dim=-1))
-        sel_mask = self._select_topk(relevance, edge_dst, self.top_k)
-        sel_dst = edge_dst[sel_mask]
-        sel_src = edge_src[sel_mask]
+        if self.top_k is not None and self.top_k > 0:
+            relevance = self.indexer(torch.cat([s0_full, data.edge_attr], dim=-1))
+            sel_mask = self._select_topk(relevance, edge_dst, self.top_k)
+            sel_dst = edge_dst[sel_mask]
+            sel_src = edge_src[sel_mask]
+            sel_edge_sh = data.edge_sh[sel_mask]
+            sel_edge_attr = data.edge_attr[sel_mask]
+            sel_s0 = s0_full[sel_mask]
+        else:
+            sel_dst = edge_dst
+            sel_src = edge_src
+            sel_edge_sh = data.edge_sh
+            sel_edge_attr = data.edge_attr
+            sel_s0 = s0_full
 
         query = self.linear_query(x)
         query_hca = filter_irrep_tensor_lmax(query, self.irrep_in_node, self.hca_lmax)
         key, value = self._project_key_value(
             x,
             sel_src,
-            data.edge_sh[sel_mask],
-            data.edge_attr[sel_mask],
-            s0_full[sel_mask],
+            sel_edge_sh,
+            sel_edge_attr,
+            sel_s0,
         )
         attended_hca = self._multihead_attention(
             query_hca, key, value, sel_dst,
