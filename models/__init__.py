@@ -5,12 +5,21 @@ This package contains the QHformer model with Inner Product Attention.
 """
 
 from .inner_product_attention import (
-    InnerProductAttentionLayer,
-    InnerProductAttentionNetLayer,
+    MultiHeadAttentionLayer,
+    MultiHeadAttentionNetLayer,
+    CompressedSparseAttentionLayer,
+    CompressedSparseAttentionNetLayer,
+    HeavyCompressedAttentionLayer,
+    HeavyCompressedAttentionNetLayer,
+    MultiHeadInnerProduct,
+    MultiHeadEquivariantNorm,
+    InvariantAttentionScore,
     InnerProduct,
     NormGate,
     ExponentialBernsteinRBF,
     get_feasible_irrep,
+    split_irreps_multiplicity,
+    merge_heads,
     scatter,
 )
 
@@ -26,9 +35,16 @@ __all__ = [
     'QHformer',
     'AttentionQHNet',
 
-    # Attention layer
-    'InnerProductAttentionLayer',
-    'InnerProductAttentionNetLayer',
+    # Attention layers
+    'MultiHeadAttentionLayer',
+    'MultiHeadAttentionNetLayer',
+    'CompressedSparseAttentionLayer',
+    'CompressedSparseAttentionNetLayer',
+    'HeavyCompressedAttentionLayer',
+    'HeavyCompressedAttentionNetLayer',
+    'MultiHeadInnerProduct',
+    'MultiHeadEquivariantNorm',
+    'InvariantAttentionScore',
 
     # QHNet components
     'SelfNetLayer',
@@ -39,5 +55,7 @@ __all__ = [
     'NormGate',
     'ExponentialBernsteinRBF',
     'get_feasible_irrep',
+    'split_irreps_multiplicity',
+    'merge_heads',
     'scatter',
 ]

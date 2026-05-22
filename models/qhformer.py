@@ -20,16 +20,17 @@ import torch.nn as nn
 import math
 from e3nn import o3
 
-# Use radius_graph from torch_cluster if available
 try:
-    from torch_cluster import radius_graph
+    from .torch_ops import radius_graph
 except ImportError:
-    from torch_geometric.nn import radius_graph
+    from torch_ops import radius_graph
 
 # Handle both relative and absolute imports
 try:
     from .inner_product_attention import (
-        InnerProductAttentionNetLayer,
+        MultiHeadAttentionNetLayer,
+        CompressedSparseAttentionNetLayer,
+        HeavyCompressedAttentionNetLayer,
         get_feasible_irrep,
         InnerProduct,
         NormGate,
@@ -38,7 +39,9 @@ try:
     )
 except ImportError:
     from inner_product_attention import (
-        InnerProductAttentionNetLayer,
+        MultiHeadAttentionNetLayer,
+        CompressedSparseAttentionNetLayer,
+        HeavyCompressedAttentionNetLayer,
         get_feasible_irrep,
         InnerProduct,
         NormGate,
@@ -269,7 +272,9 @@ class PairNetLayer(nn.Module):
             nn.Linear(self.irrep_in_node[0][0], self.tp_node_pair.weight_numel))
 
     def forward(self, data, node_attr, node_pair_attr=None):
-        dst, src = data.full_edge_index
+        pair_edge_index = getattr(data, "pair_edge_index", data.full_edge_index)
+        pair_edge_attr = getattr(data, "pair_edge_attr", data.full_edge_attr)
+        dst, src = pair_edge_index
         node_attr_0 = self.linear_node_pair_inner(node_attr)
         s0 = self.inner_product(node_attr_0[dst], node_attr_0[src])[:, self.irrep_in_node.slices()[0].stop:]
         s0 = torch.cat([node_attr_0[dst][:, self.irrep_in_node.slices()[0]],
@@ -279,7 +284,7 @@ class PairNetLayer(nn.Module):
         node_attr = self.linear_node_pair_n(node_attr)
 
         node_pair = self.tp_node_pair(node_attr[src], node_attr[dst],
-            self.fc_node_pair(data.full_edge_attr) * self.fc(s0))
+            self.fc_node_pair(pair_edge_attr) * self.fc(s0))
 
         node_pair = self.norm_gate(node_pair)
         node_pair = self.linear_node_pair_final(node_pair)
@@ -413,7 +418,7 @@ class QHformer(nn.Module):
     Architecture:
         1. Graph construction with spherical harmonics
         2. Node embedding
-        3. InnerProductAttentionLayer (core innovation)
+        3. CSA/HCA multi-head inner-product attention layers
         4. SelfNet and PairNet (same as original QHNet)
         5. Expansion to Hamiltonian blocks
         6. Matrix assembly and symmetrization
@@ -434,6 +439,13 @@ class QHformer(nn.Module):
         num_nodes: Maximum number of atoms (default: 10)
         radius_embed_dim: Radial basis embedding dimension (default: 32)
         attention_temperature: Temperature for attention (default: 1.0)
+        num_heads: Number of multiplicity-split attention heads (default: 4)
+        use_hybrid_attention: Use CSA-HCA-CSA-HCA alternation when True
+        csa_top_k: Max incoming edges per node in CSA layers
+        hca_top_k: Max incoming edges per node in edge-sparse HCA layers
+        hca_lmax: Maximum angular degree retained in HCA K/V compression
+        indexer_compress_dim: Hidden dimension of CSA Lightning Indexer
+        attention_score_residual_init_std: Std for nonzero learnable attention-score residual init.
     """
 
     def __init__(
@@ -447,6 +459,13 @@ class QHformer(nn.Module):
         num_nodes=10,
         radius_embed_dim=32,
         attention_temperature=1.0,
+        num_heads=4,
+        use_hybrid_attention=True,
+        csa_top_k=8,
+        hca_top_k=8,
+        hca_lmax=2,
+        indexer_compress_dim=32,
+        attention_score_residual_init_std=0.0,
     ):
         super(QHformer, self).__init__()
         self.order = sh_lmax
@@ -457,6 +476,13 @@ class QHformer(nn.Module):
         self.radius_embed_dim = radius_embed_dim
         self.max_radius = max_radius
         self.num_gnn_layers = num_gnn_layers
+        self.num_heads = num_heads
+        self.use_hybrid_attention = use_hybrid_attention
+        self.csa_top_k = csa_top_k
+        self.hca_top_k = hca_top_k
+        self.hca_lmax = hca_lmax
+        self.indexer_compress_dim = indexer_compress_dim
+        self.attention_score_residual_init_std = attention_score_residual_init_std
 
         # Use atomic number embedding (max Z=118 for periodic table)
         self.node_embedding = nn.Embedding(118, self.hs)
@@ -474,9 +500,16 @@ class QHformer(nn.Module):
         self.num_fc_layer = 1
         self.start_layer = 2
 
-        # ============ Inner Product Attention Layers ============
-        print(f"QHformer initialized with Inner Product Attention:")
+        # ============ Multi-Head CSA/HCA Attention Layers ============
+        print(f"QHformer initialized with Multi-Head {'Hybrid CSA/HCA' if use_hybrid_attention else 'Dense'} Attention:")
         print(f"  attention_temperature = {attention_temperature}")
+        print(f"  num_heads = {num_heads}")
+        if use_hybrid_attention:
+            print(f"  pattern = CSA-HCA-CSA-HCA")
+            print(f"  csa_top_k = {csa_top_k}")
+            print(f"  hca_top_k = {hca_top_k}")
+            print(f"  hca_lmax = {hca_lmax}")
+        print(f"  attention_score_residual_init_std = {attention_score_residual_init_std}")
         print(f"  Query/Key irreps = {self.hidden_irrep}")
 
         self.e3_gnn_layer = nn.ModuleList()
@@ -486,18 +519,55 @@ class QHformer(nn.Module):
         for i in range(self.num_gnn_layers):
             input_irrep = self.input_irrep if i == 0 else self.hidden_irrep
 
-            # Use InnerProductAttentionLayer instead of standard ConvLayer
-            self.e3_gnn_layer.append(InnerProductAttentionNetLayer(
-                irrep_in_node=input_irrep,
-                irrep_hidden=self.hidden_irrep,
-                irrep_out=self.hidden_irrep,
-                edge_attr_dim=self.radius_embed_dim,
-                node_attr_dim=self.hs,
-                sh_irrep=self.sh_irrep,
-                resnet=True,
-                use_norm_gate=True if i != 0 else False,
-                attention_temperature=attention_temperature,
-            ))
+            if use_hybrid_attention:
+                if i % 2 == 0:
+                    layer = CompressedSparseAttentionNetLayer(
+                        irrep_in_node=input_irrep,
+                        irrep_hidden=self.hidden_irrep,
+                        irrep_out=self.hidden_irrep,
+                        edge_attr_dim=self.radius_embed_dim,
+                        node_attr_dim=self.hs,
+                        sh_irrep=self.sh_irrep,
+                        resnet=True,
+                        use_norm_gate=True if i != 0 else False,
+                        attention_temperature=attention_temperature,
+                        num_heads=num_heads,
+                        top_k=csa_top_k,
+                        indexer_compress_dim=indexer_compress_dim,
+                        attention_score_residual_init_std=attention_score_residual_init_std,
+                    )
+                else:
+                    layer = HeavyCompressedAttentionNetLayer(
+                        irrep_in_node=input_irrep,
+                        irrep_hidden=self.hidden_irrep,
+                        irrep_out=self.hidden_irrep,
+                        edge_attr_dim=self.radius_embed_dim,
+                        node_attr_dim=self.hs,
+                        sh_irrep=self.sh_irrep,
+                        resnet=True,
+                        use_norm_gate=True if i != 0 else False,
+                        attention_temperature=attention_temperature,
+                        num_heads=num_heads,
+                        hca_lmax=hca_lmax,
+                        top_k=hca_top_k,
+                        indexer_compress_dim=indexer_compress_dim,
+                        attention_score_residual_init_std=attention_score_residual_init_std,
+                    )
+            else:
+                layer = MultiHeadAttentionNetLayer(
+                    irrep_in_node=input_irrep,
+                    irrep_hidden=self.hidden_irrep,
+                    irrep_out=self.hidden_irrep,
+                    edge_attr_dim=self.radius_embed_dim,
+                    node_attr_dim=self.hs,
+                    sh_irrep=self.sh_irrep,
+                    resnet=True,
+                    use_norm_gate=True if i != 0 else False,
+                    attention_temperature=attention_temperature,
+                    num_heads=num_heads,
+                    attention_score_residual_init_std=attention_score_residual_init_std,
+                )
+            self.e3_gnn_layer.append(layer)
 
             if i > self.start_layer:
                 self.e3_gnn_node_layer.append(SelfNetLayer(
@@ -588,18 +658,35 @@ class QHformer(nn.Module):
 
     def forward(self, data, keep_blocks=False):
         """Forward pass with Inner Product Attention"""
-        # Build graph
-        node_attr, edge_index, rbf_new, edge_sh, _ = self.build_graph(data, self.max_radius)
+        # Build graph, or reuse static QH9 graph cache when present. The RBF
+        # layer remains live because its centers/std are trainable.
+        if all(hasattr(data, key) for key in ("edge_index", "edge_dist", "edge_sh")):
+            node_attr = data.atoms.squeeze()
+            edge_index = data.edge_index
+            rbf_new = self.expand_edge_distances(data.edge_dist).type(data.pos.type())
+            edge_sh = data.edge_sh.type(data.pos.type())
+        else:
+            node_attr, edge_index, rbf_new, edge_sh, _ = self.build_graph(data, self.max_radius)
         node_attr = self.node_embedding(node_attr)
         data.node_attr, data.edge_index, data.edge_attr, data.edge_sh = \
             node_attr, edge_index, rbf_new, edge_sh
 
-        # Build full graph for PairNet
-        _, full_edge_index, full_edge_attr, full_edge_sh, transpose_edge_index = self.build_graph(data, 10000)
+        # Build full graph for PairNet, or reuse cached complete graph.
+        if all(hasattr(data, key) for key in ("full_edge_index", "full_edge_dist", "full_edge_sh")):
+            full_edge_index = data.full_edge_index
+            full_edge_attr = self.expand_edge_distances(data.full_edge_dist).type(data.pos.type())
+            full_edge_sh = data.full_edge_sh.type(data.pos.type())
+            transpose_edge_index = getattr(data, "full_transpose_perm", None)
+        else:
+            _, full_edge_index, full_edge_attr, full_edge_sh, transpose_edge_index = self.build_graph(data, 10000)
         data.full_edge_index, data.full_edge_attr, data.full_edge_sh = \
             full_edge_index, full_edge_attr, full_edge_sh
+        pair_edge_index, pair_edge_attr, pair_edge_sh = self.prepare_pair_graph(
+            data, full_edge_index, full_edge_attr, full_edge_sh)
+        data.pair_edge_index, data.pair_edge_attr, data.pair_edge_sh = \
+            pair_edge_index, pair_edge_attr, pair_edge_sh
 
-        full_dst, full_src = data.full_edge_index
+        pair_dst, pair_src = data.pair_edge_index
 
         tic = time.time()
         fii = None
@@ -622,7 +709,7 @@ class QHformer(nn.Module):
                              device=node_attr.device, dtype=node_attr.dtype)
         if fij is None:
             # Create zero tensor with correct shape for output_ij input
-            num_edges = data.full_edge_index.shape[1]
+            num_edges = data.pair_edge_index.shape[1]
             fij = torch.zeros(num_edges, self.hidden_irrep.dim,
                              device=node_attr.device, dtype=node_attr.dtype)
 
@@ -633,7 +720,7 @@ class QHformer(nn.Module):
         hamiltonian_diagonal_matrix = self.expand_ii['hamiltonian'](
             fii, self.fc_ii['hamiltonian'](data.node_attr), self.fc_ii_bias['hamiltonian'](data.node_attr))
 
-        node_pair_embedding = torch.cat([data.node_attr[full_dst], data.node_attr[full_src]], dim=-1)
+        node_pair_embedding = torch.cat([data.node_attr[pair_dst], data.node_attr[pair_src]], dim=-1)
         hamiltonian_non_diagonal_matrix = self.expand_ij['hamiltonian'](
             fij, self.fc_ij['hamiltonian'](node_pair_embedding),
             self.fc_ij_bias['hamiltonian'](node_pair_embedding))
@@ -659,13 +746,48 @@ class QHformer(nn.Module):
         else:
             ret_hamiltonian_diagonal_matrix = hamiltonian_diagonal_matrix +\
                                           hamiltonian_diagonal_matrix.transpose(-1, -2)
-            ret_hamiltonian_non_diagonal_matrix = hamiltonian_non_diagonal_matrix + \
+            if (transpose_edge_index is not None and
+                    hamiltonian_non_diagonal_matrix.shape[0] == data.full_edge_index.shape[1]):
+                ret_hamiltonian_non_diagonal_matrix = hamiltonian_non_diagonal_matrix + \
                       hamiltonian_non_diagonal_matrix[transpose_edge_index].transpose(-1, -2)
+            else:
+                ret_hamiltonian_non_diagonal_matrix = hamiltonian_non_diagonal_matrix
             results = {}
             results['hamiltonian_diagonal_blocks'] = ret_hamiltonian_diagonal_matrix
             results['hamiltonian_non_diagonal_blocks'] = ret_hamiltonian_non_diagonal_matrix
+            results['pair_edge_index'] = data.pair_edge_index
 
         return results
+
+    def expand_edge_distances(self, edge_dist):
+        return self.distance_expansion(edge_dist.reshape(-1, 1)).reshape(-1, self.radius_embed_dim)
+
+    def prepare_pair_graph(self, data, full_edge_index, full_edge_attr, full_edge_sh):
+        """Return one directed atom pair per unordered pair for PairNet.
+
+        SPHNet predicts only one off-diagonal block for each unordered atom
+        pair, then recovers the Hermitian counterpart by transposition during
+        matrix assembly.  Selecting by ``dst > src`` is invariant to the
+        molecule's 3D orientation and halves PairNet/Expansion work.
+        """
+        if all(hasattr(data, key) for key in ("pair_edge_index", "pair_edge_dist", "pair_edge_sh")):
+            pair_edge_index = data.pair_edge_index
+            pair_edge_attr = self.expand_edge_distances(data.pair_edge_dist).type(data.pos.type())
+            pair_edge_sh = data.pair_edge_sh.type(data.pos.type())
+            return pair_edge_index, pair_edge_attr, pair_edge_sh
+
+        if hasattr(data, "pair_edge_index"):
+            pair_edge_index = data.pair_edge_index
+            pair_dst, pair_src = pair_edge_index
+            pair_vec = data.pos[pair_dst.long()] - data.pos[pair_src.long()]
+            pair_edge_attr = self.expand_edge_distances(pair_vec.norm(dim=-1)).type(data.pos.type())
+            pair_edge_sh = o3.spherical_harmonics(
+                self.sh_irrep, pair_vec[:, [1, 2, 0]],
+                normalize=True, normalization='component').type(data.pos.type())
+            return pair_edge_index, pair_edge_attr, pair_edge_sh
+
+        pair_mask = full_edge_index[0] > full_edge_index[1]
+        return full_edge_index[:, pair_mask], full_edge_attr[pair_mask], full_edge_sh[pair_mask]
 
     def build_graph(self, data, max_radius):
         """Build molecular graph with spherical harmonics"""
@@ -674,7 +796,7 @@ class QHformer(nn.Module):
 
         dst, src = radius_edges
         edge_vec = data.pos[dst.long()] - data.pos[src.long()]
-        rbf = self.distance_expansion(edge_vec.norm(dim=-1).unsqueeze(-1)).squeeze().type(data.pos.type())
+        rbf = self.expand_edge_distances(edge_vec.norm(dim=-1)).type(data.pos.type())
 
         edge_sh = o3.spherical_harmonics(
             self.sh_irrep, edge_vec[:, [1, 2, 0]],
@@ -696,37 +818,70 @@ class QHformer(nn.Module):
         return node_attr, radius_edges, rbf, edge_sh, torch.cat(all_transpose_index, dim=-1)
 
     def build_final_matrix(self, data, diagonal_matrix, non_diagonal_matrix):
-        """Assemble final Hamiltonian matrix from blocks"""
-        final_matrix = []
-        dst, src = data.full_edge_index
-        for graph_idx in range(data.ptr.shape[0] - 1):
-            matrix_block_col = []
-            for src_idx in range(data.ptr[graph_idx], data.ptr[graph_idx+1]):
-                matrix_col = []
-                for dst_idx in range(data.ptr[graph_idx], data.ptr[graph_idx+1]):
-                    if src_idx == dst_idx:
-                        matrix_col.append(diagonal_matrix[src_idx].index_select(
-                            -2, self.orbital_mask[data.atoms[dst_idx].item()]).index_select(
-                            -1, self.orbital_mask[data.atoms[src_idx].item()])
-                        )
-                    else:
-                        mask1 = (src == src_idx)
-                        mask2 = (dst == dst_idx)
-                        index = torch.where(mask1 & mask2)[0].item()
+        """Assemble final Hamiltonian matrix from orbital blocks.
 
-                        matrix_col.append(
-                            non_diagonal_matrix[index].index_select(
-                                -2, self.orbital_mask[data.atoms[dst_idx].item()]).index_select(
-                                    -1, self.orbital_mask[data.atoms[src_idx].item()]))
-                matrix_block_col.append(torch.cat(matrix_col, dim=-2))
-            final_matrix.append(torch.cat(matrix_block_col, dim=-1))
+        This follows SPHNet's block2matrix pattern: fill a dense
+        [atom, atom, max_block, max_block] tensor first, then reshape and select
+        the atom-specific orbital rows/columns. The previous implementation
+        searched full_edge_index for every off-diagonal block, which introduced
+        many tiny GPU synchronizations.
+        """
+        final_matrix = []
+        full_edge_index = data.full_edge_index
+        candidate_pair_edge_index = getattr(data, "pair_edge_index", None)
+        if candidate_pair_edge_index is None:
+            pair_mask = full_edge_index[0] > full_edge_index[1]
+            candidate_pair_edge_index = full_edge_index[:, pair_mask]
+        use_half_edges = (
+            candidate_pair_edge_index is not None and
+            non_diagonal_matrix.shape[0] == candidate_pair_edge_index.shape[1] and
+            candidate_pair_edge_index.shape[1] != full_edge_index.shape[1]
+        )
+        edge_index = candidate_pair_edge_index if use_half_edges else full_edge_index
+        dst, src = edge_index
+        max_block_size = diagonal_matrix.shape[-1]
+        edge_start = 0
+        for graph_idx in range(data.ptr.shape[0] - 1):
+            node_start = int(data.ptr[graph_idx].item())
+            node_end = int(data.ptr[graph_idx + 1].item())
+            num_nodes = node_end - node_start
+            num_edges = num_nodes * (num_nodes - 1) // 2 if use_half_edges else num_nodes * (num_nodes - 1)
+
+            blocks = torch.zeros(
+                num_nodes,
+                num_nodes,
+                max_block_size,
+                max_block_size,
+                dtype=diagonal_matrix.dtype,
+                device=diagonal_matrix.device,
+            )
+
+            diag_idx = torch.arange(num_nodes, device=diagonal_matrix.device)
+            blocks[diag_idx, diag_idx] = diagonal_matrix[node_start:node_end]
+
+            if num_edges > 0:
+                graph_dst = dst[edge_start:edge_start + num_edges].long() - node_start
+                graph_src = src[edge_start:edge_start + num_edges].long() - node_start
+                blocks[graph_dst, graph_src] = non_diagonal_matrix[edge_start:edge_start + num_edges]
+
+            dense = blocks.permute(0, 2, 1, 3).reshape(
+                num_nodes * max_block_size,
+                num_nodes * max_block_size,
+            )
+            atom_orbitals = []
+            atoms = data.atoms[node_start:node_end].reshape(-1)
+            for atom_idx, atom in enumerate(atoms):
+                atom_orbitals.append(
+                    atom_idx * max_block_size + self.orbital_mask[int(atom.item())].to(diagonal_matrix.device)
+                )
+            atom_orbitals = torch.cat(atom_orbitals, dim=0)
+            final_matrix.append(dense.index_select(0, atom_orbitals).index_select(1, atom_orbitals))
+            edge_start += num_edges
         final_matrix = torch.stack(final_matrix, dim=0)
         return final_matrix
 
     def get_orbital_mask(self):
-        """Get orbital mask for different atom types
-
-        CRITICAL: Must select COMPLETE irreducible representations for SE(3) equivariance!
+        """Get orbital mask for different atom types matching MD17 SchNOrb.
 
         Expansion output: 3x0e + 2x1e + 1x2e (14 orbitals per atom)
         - 3x0e: s-orbitals at indices [0, 1, 2]
@@ -735,29 +890,18 @@ class QHformer(nn.Module):
           * Second p-orbital: [6, 7, 8] (1x1e)
         - 1x2e: d-orbitals at indices [9, 10, 11, 12, 13]
 
-        For proper equivariance, we must select complete multiplets:
-        - For H (Z=1): 1s only → [0] (1x0e)
-        - For He (Z=2): 1s2s → [0, 1] (2x0e)
-        - For Li-Be (Z=3,4): 1s2s + 2p → [0, 1] + [3, 4, 5] = [0, 1, 3, 4, 5] (2x0e + 1x1e)
-        - For B+ (Z=5+): all 14 orbitals
+        MD17/SchNOrb uses H as ``ssp`` after hamiltonian_transform:
+        2 scalar orbitals + one complete p multiplet = 5 orbitals.
+        Complete multiplets are kept to preserve SO(3) equivariance.
         """
-        # For H (Z=1): 1s orbital only (1x0e - complete)
-        orbital_mask_h = torch.tensor([0])
-
-        # For He (Z=2): 1s + 2s (2x0e - complete)
-        orbital_mask_he = torch.tensor([0, 1])
-
-        # For Li-Be (Z=3-4): 1s + 2s + 2p minimal basis (2x0e + 1x1e - complete)
-        orbital_mask_light = torch.cat([torch.tensor([0, 1]), torch.tensor([3, 4, 5])])
-
-        # For B+ (Z=5+): full valence basis (3x0e + 2x1e + 1x2e - complete)
+        orbital_mask_line1 = torch.cat([torch.tensor([0, 1]), torch.tensor([3, 4, 5])])
         orbital_mask_full = torch.arange(14)
 
         orbital_mask = {}
-        orbital_mask[1] = orbital_mask_h  # H: 1s
-        orbital_mask[2] = orbital_mask_he  # He: 1s2s
-        orbital_mask[3] = orbital_mask_light  # Li: 1s2s2p
-        orbital_mask[4] = orbital_mask_light  # Be: 1s2s2p
+        orbital_mask[1] = orbital_mask_line1  # H: ssp
+        orbital_mask[2] = orbital_mask_line1  # He/light first-row fallback
+        orbital_mask[3] = orbital_mask_full
+        orbital_mask[4] = orbital_mask_full
         orbital_mask[5] = orbital_mask_full  # B+: all
         orbital_mask[6] = orbital_mask_full  # C: all
         orbital_mask[7] = orbital_mask_full  # N: all
