@@ -272,7 +272,9 @@ class PairNetLayer(nn.Module):
             nn.Linear(self.irrep_in_node[0][0], self.tp_node_pair.weight_numel))
 
     def forward(self, data, node_attr, node_pair_attr=None):
-        dst, src = data.full_edge_index
+        pair_edge_index = getattr(data, "pair_edge_index", data.full_edge_index)
+        pair_edge_attr = getattr(data, "pair_edge_attr", data.full_edge_attr)
+        dst, src = pair_edge_index
         node_attr_0 = self.linear_node_pair_inner(node_attr)
         s0 = self.inner_product(node_attr_0[dst], node_attr_0[src])[:, self.irrep_in_node.slices()[0].stop:]
         s0 = torch.cat([node_attr_0[dst][:, self.irrep_in_node.slices()[0]],
@@ -282,7 +284,7 @@ class PairNetLayer(nn.Module):
         node_attr = self.linear_node_pair_n(node_attr)
 
         node_pair = self.tp_node_pair(node_attr[src], node_attr[dst],
-            self.fc_node_pair(data.full_edge_attr) * self.fc(s0))
+            self.fc_node_pair(pair_edge_attr) * self.fc(s0))
 
         node_pair = self.norm_gate(node_pair)
         node_pair = self.linear_node_pair_final(node_pair)
@@ -661,7 +663,7 @@ class QHformer(nn.Module):
         if all(hasattr(data, key) for key in ("edge_index", "edge_dist", "edge_sh")):
             node_attr = data.atoms.squeeze()
             edge_index = data.edge_index
-            rbf_new = self.distance_expansion(data.edge_dist.unsqueeze(-1)).squeeze().type(data.pos.type())
+            rbf_new = self.expand_edge_distances(data.edge_dist).type(data.pos.type())
             edge_sh = data.edge_sh.type(data.pos.type())
         else:
             node_attr, edge_index, rbf_new, edge_sh, _ = self.build_graph(data, self.max_radius)
@@ -672,15 +674,19 @@ class QHformer(nn.Module):
         # Build full graph for PairNet, or reuse cached complete graph.
         if all(hasattr(data, key) for key in ("full_edge_index", "full_edge_dist", "full_edge_sh")):
             full_edge_index = data.full_edge_index
-            full_edge_attr = self.distance_expansion(data.full_edge_dist.unsqueeze(-1)).squeeze().type(data.pos.type())
+            full_edge_attr = self.expand_edge_distances(data.full_edge_dist).type(data.pos.type())
             full_edge_sh = data.full_edge_sh.type(data.pos.type())
             transpose_edge_index = getattr(data, "full_transpose_perm", None)
         else:
             _, full_edge_index, full_edge_attr, full_edge_sh, transpose_edge_index = self.build_graph(data, 10000)
         data.full_edge_index, data.full_edge_attr, data.full_edge_sh = \
             full_edge_index, full_edge_attr, full_edge_sh
+        pair_edge_index, pair_edge_attr, pair_edge_sh = self.prepare_pair_graph(
+            data, full_edge_index, full_edge_attr, full_edge_sh)
+        data.pair_edge_index, data.pair_edge_attr, data.pair_edge_sh = \
+            pair_edge_index, pair_edge_attr, pair_edge_sh
 
-        full_dst, full_src = data.full_edge_index
+        pair_dst, pair_src = data.pair_edge_index
 
         tic = time.time()
         fii = None
@@ -703,7 +709,7 @@ class QHformer(nn.Module):
                              device=node_attr.device, dtype=node_attr.dtype)
         if fij is None:
             # Create zero tensor with correct shape for output_ij input
-            num_edges = data.full_edge_index.shape[1]
+            num_edges = data.pair_edge_index.shape[1]
             fij = torch.zeros(num_edges, self.hidden_irrep.dim,
                              device=node_attr.device, dtype=node_attr.dtype)
 
@@ -714,7 +720,7 @@ class QHformer(nn.Module):
         hamiltonian_diagonal_matrix = self.expand_ii['hamiltonian'](
             fii, self.fc_ii['hamiltonian'](data.node_attr), self.fc_ii_bias['hamiltonian'](data.node_attr))
 
-        node_pair_embedding = torch.cat([data.node_attr[full_dst], data.node_attr[full_src]], dim=-1)
+        node_pair_embedding = torch.cat([data.node_attr[pair_dst], data.node_attr[pair_src]], dim=-1)
         hamiltonian_non_diagonal_matrix = self.expand_ij['hamiltonian'](
             fij, self.fc_ij['hamiltonian'](node_pair_embedding),
             self.fc_ij_bias['hamiltonian'](node_pair_embedding))
@@ -740,13 +746,48 @@ class QHformer(nn.Module):
         else:
             ret_hamiltonian_diagonal_matrix = hamiltonian_diagonal_matrix +\
                                           hamiltonian_diagonal_matrix.transpose(-1, -2)
-            ret_hamiltonian_non_diagonal_matrix = hamiltonian_non_diagonal_matrix + \
+            if (transpose_edge_index is not None and
+                    hamiltonian_non_diagonal_matrix.shape[0] == data.full_edge_index.shape[1]):
+                ret_hamiltonian_non_diagonal_matrix = hamiltonian_non_diagonal_matrix + \
                       hamiltonian_non_diagonal_matrix[transpose_edge_index].transpose(-1, -2)
+            else:
+                ret_hamiltonian_non_diagonal_matrix = hamiltonian_non_diagonal_matrix
             results = {}
             results['hamiltonian_diagonal_blocks'] = ret_hamiltonian_diagonal_matrix
             results['hamiltonian_non_diagonal_blocks'] = ret_hamiltonian_non_diagonal_matrix
+            results['pair_edge_index'] = data.pair_edge_index
 
         return results
+
+    def expand_edge_distances(self, edge_dist):
+        return self.distance_expansion(edge_dist.reshape(-1, 1)).reshape(-1, self.radius_embed_dim)
+
+    def prepare_pair_graph(self, data, full_edge_index, full_edge_attr, full_edge_sh):
+        """Return one directed atom pair per unordered pair for PairNet.
+
+        SPHNet predicts only one off-diagonal block for each unordered atom
+        pair, then recovers the Hermitian counterpart by transposition during
+        matrix assembly.  Selecting by ``dst > src`` is invariant to the
+        molecule's 3D orientation and halves PairNet/Expansion work.
+        """
+        if all(hasattr(data, key) for key in ("pair_edge_index", "pair_edge_dist", "pair_edge_sh")):
+            pair_edge_index = data.pair_edge_index
+            pair_edge_attr = self.expand_edge_distances(data.pair_edge_dist).type(data.pos.type())
+            pair_edge_sh = data.pair_edge_sh.type(data.pos.type())
+            return pair_edge_index, pair_edge_attr, pair_edge_sh
+
+        if hasattr(data, "pair_edge_index"):
+            pair_edge_index = data.pair_edge_index
+            pair_dst, pair_src = pair_edge_index
+            pair_vec = data.pos[pair_dst.long()] - data.pos[pair_src.long()]
+            pair_edge_attr = self.expand_edge_distances(pair_vec.norm(dim=-1)).type(data.pos.type())
+            pair_edge_sh = o3.spherical_harmonics(
+                self.sh_irrep, pair_vec[:, [1, 2, 0]],
+                normalize=True, normalization='component').type(data.pos.type())
+            return pair_edge_index, pair_edge_attr, pair_edge_sh
+
+        pair_mask = full_edge_index[0] > full_edge_index[1]
+        return full_edge_index[:, pair_mask], full_edge_attr[pair_mask], full_edge_sh[pair_mask]
 
     def build_graph(self, data, max_radius):
         """Build molecular graph with spherical harmonics"""
@@ -755,7 +796,7 @@ class QHformer(nn.Module):
 
         dst, src = radius_edges
         edge_vec = data.pos[dst.long()] - data.pos[src.long()]
-        rbf = self.distance_expansion(edge_vec.norm(dim=-1).unsqueeze(-1)).squeeze().type(data.pos.type())
+        rbf = self.expand_edge_distances(edge_vec.norm(dim=-1)).type(data.pos.type())
 
         edge_sh = o3.spherical_harmonics(
             self.sh_irrep, edge_vec[:, [1, 2, 0]],
@@ -786,14 +827,25 @@ class QHformer(nn.Module):
         many tiny GPU synchronizations.
         """
         final_matrix = []
-        dst, src = data.full_edge_index
+        full_edge_index = data.full_edge_index
+        candidate_pair_edge_index = getattr(data, "pair_edge_index", None)
+        if candidate_pair_edge_index is None:
+            pair_mask = full_edge_index[0] > full_edge_index[1]
+            candidate_pair_edge_index = full_edge_index[:, pair_mask]
+        use_half_edges = (
+            candidate_pair_edge_index is not None and
+            non_diagonal_matrix.shape[0] == candidate_pair_edge_index.shape[1] and
+            candidate_pair_edge_index.shape[1] != full_edge_index.shape[1]
+        )
+        edge_index = candidate_pair_edge_index if use_half_edges else full_edge_index
+        dst, src = edge_index
         max_block_size = diagonal_matrix.shape[-1]
         edge_start = 0
         for graph_idx in range(data.ptr.shape[0] - 1):
             node_start = int(data.ptr[graph_idx].item())
             node_end = int(data.ptr[graph_idx + 1].item())
             num_nodes = node_end - node_start
-            num_edges = num_nodes * (num_nodes - 1)
+            num_edges = num_nodes * (num_nodes - 1) // 2 if use_half_edges else num_nodes * (num_nodes - 1)
 
             blocks = torch.zeros(
                 num_nodes,
