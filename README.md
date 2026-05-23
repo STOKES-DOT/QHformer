@@ -5,6 +5,7 @@ QHformer predicts quantum Hamiltonian matrices from molecular geometries with SO
 - **Multi-head inner-product attention** with head splitting only along irrep multiplicity axes.
 - **CSA (Compressed Sparse Attention)** layers with invariant indexer scoring and per-destination top-k edge selection.
 - **HCA (Heavy Compressed Attention)** layers with low-order K/V compression while keeping full-irrep Q.
+- **Optional SO(2) edge-frame K/V convolution** following the EquiformerV2/eSCN rotate-convolve-rotate-back pattern.
 - **CSA-HCA-CSA-HCA** alternating pattern across the default 4 GNN layers.
 - **Identity-initialized NormGate and attention residuals** so random-parameter models preserve non-scalar equivariant channels instead of collapsing to invariants.
 
@@ -80,6 +81,7 @@ QHformer/
 ├── models/
 │   ├── __init__.py
 │   ├── inner_product_attention.py     # Multi-head, CSA, HCA attention layers
+│   ├── so2_ops.py                     # Edge-frame SO(2) convolution operators
 │   └── qhformer.py                    # Main QHformer model
 ├── scripts/
 │   └── generate_equivariance_panels.py # README equivariance figure generator
@@ -138,6 +140,7 @@ model = QHformer(
     hca_lmax=3,
     indexer_compress_dim=32,
     attention_score_residual_init_std=0.0,
+    attention_operator="tp",     # "tp" or "so2"
 )
 
 outputs = model(batch_data)
@@ -145,6 +148,8 @@ hamiltonian = outputs["hamiltonian"]
 ```
 
 Set `use_hybrid_attention=False` to run all layers as dense multi-head inner-product attention.
+
+Set `attention_operator="so2"` to replace attention K/V tensor products with edge-frame SO(2) convolutions.
 
 ## Architecture
 
@@ -225,6 +230,29 @@ V_ij:  l <= hca_lmax
 
 After aggregation, omitted high-order value channels are padded with zeros before the output projection. The query still sees the full directional state; the compression only limits the key/value carrier used by that layer.
 
+### SO(2) Edge-Frame K/V Operator
+
+`SO2EdgeConv` follows the DeePTB-E3/EquiformerV2/eSCN reduction of SO(3) convolution to an edge-aligned SO(2) convolution:
+
+```text
+global irreps
+  -> deterministic local frame with z aligned to r_ij
+  -> SO(2)-equivariant local mixing
+  -> rotate back to global irreps
+```
+
+The current QHformer operator uses DeePTB-style per-`|m|` dense mixing:
+
+- each `|m|` subspace is extracted from the e3nn real irrep basis using the z-rotation generator,
+- edge-frame rotation and canonical `m`-basis conversion are fused into one per-`l` transform before per-`m` mixing,
+- canonical `m` channels are packed into contiguous per-`m` slices before the SO(2) linear mixing and unpacked once before rotating back,
+- the reverse canonical-to-global transform is fused before returning to e3nn flat irreps,
+- `m=0` uses real dense channel mixing,
+- `m>0` uses real/imag paired mixing equivalent to a complex SO(2)-linear map,
+- external edge weights modulate input or output channels, while dense mixing weights are shared parameters.
+
+This keeps the operator rotation-equivariant while introducing edge-direction-dependent K/V messages and cross-`l` nonzero-`m` mixing. It is enabled with `attention_operator="so2"`. `SO2EdgeConv` caches detached edge-frame Wigner-D rotation blocks by angular order `l` after the first forward for a repeated static edge geometry, so later forwards can reuse one rotation block per `l`. The cache is invalidated by changed edge vectors, dtype, device, or module device moves. Set `detach_rotations=False` on the operator when geometry gradients are required; that path disables cache reuse for those rotations and keeps gradients flowing to `edge_vec`.
+
 ### NormGate and Residuals
 
 `NormGate` is identity-initialized:
@@ -251,6 +279,7 @@ Default water configuration in `training/train_qhformer.py`:
 | `hca_lmax` | 3 |
 | `indexer_compress_dim` | 32 |
 | `attention_score_residual_init_std` | 0.0 |
+| `attention_operator` | `"tp"` |
 | `batch_size` | 512 |
 | `num_epochs` | 15000 |
 | `learning_rate` | 1e-3 |
@@ -282,8 +311,45 @@ python training/measure_water_memory.py \
   --molecule water \
   --device cuda:0 \
   --batch-sizes 128,256,512 \
-  --hca-lmax 3
+  --hca-lmax 3 \
+  --attention-operator so2
 ```
+
+### Attention Sparsity Benchmark
+
+Run the remote GPU micro-benchmark for dense TP, SO(2) K/V operators, and CSA/HCA variants:
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python scripts/benchmark_attention_sparsity.py \
+  --device cuda \
+  --hidden-size 64 \
+  --num-nodes 64 \
+  --num-edges 2048 \
+  --iters 20 \
+  --warmup 5 \
+  --top-k 8 \
+  --hca-lmax 3 \
+  --json
+```
+
+Current remote GPU6 result on `c20`, RTX 5090, `DeepMolH`, `CUDA_VISIBLE_DEVICES=6`, hidden 64 / nodes 64 / edges 2048, 20 timed iterations:
+
+| Config | Dense TP | SO(2) | Speedup | Peak memory |
+|--------|----------|-------|---------|-------------|
+| Operator only | 2.25 ms | 2.10 ms | 1.07x | 216 MB -> 151 MB |
+| Full attention | 10.39 ms | 10.17 ms | 1.02x | 583 MB -> 380 MB |
+
+Hybrid GPU result on the same hidden 64 / nodes 64 / edges 2048 benchmark:
+
+| Variant | Runtime | Speedup vs dense TP attention | Peak memory ratio |
+|---------|---------|-------------------------------|-------------------|
+| Dense TP | 11.16 ms | 1.00x | 100% |
+| CSA + TP | 10.53 ms | 1.06x | 33.1% |
+| CSA + SO(2) | 9.65 ms | 1.16x | 24.0% |
+| HCA + TP | 10.61 ms | 1.05x | 27.1% |
+| HCA + SO(2) | 9.53 ms | 1.17x | 24.4% |
+
+The SO(2) hot path now follows DeePTB-style real/imag `m>0` mixing with one linear projection per `|m|`, and detached Wigner-D rotations use precomputed axis bases with runtime `sin`/`cos` blocks on the input device instead of CPU round-trips or runtime matrix exponentials. A dynamic-geometry `cache_rotations=False` micro-benchmark on the same GPU and hidden 64 / edges 2048 setup improved from 767 ms to 18.8 ms per SO(2) operator call. The operator still launches separate PyTorch kernels for packing, per-`m` mixing, unpacking, and the final fused reverse transform; a fused/channel-native kernel is the next target if SO(2) becomes the default training operator.
 
 ## Verification
 
@@ -301,12 +367,16 @@ The test coverage checks:
 - identity initialization of `NormGate`,
 - CSA/HCA/multi-head forward finite output,
 - CSA-HCA-CSA-HCA construction in `QHformer`,
+- SO(2) edge convolution rotation equivariance, DeePTB-style packed `m` channel indexing, fused rotation/`m`-basis transforms, angular-order rotation cache reuse, nonzero-`m` cross-`l` mixing, and optional geometry-gradient support,
 - Hamiltonian trace/eigenvalue invariance under random water rotations.
 
 Latest local verification:
 
 ```text
-11 passed
+pytest -q tests/test_so2_ops.py tests/test_hca_sparse_attention.py tests/test_hybrid_equivariance.py
+26 passed
+pytest -q
+30 passed
 ```
 
 A random-parameter water rotation diagnostic after the NormGate/residual fix showed non-invariant matrix entries with invariant spectrum:
@@ -351,7 +421,9 @@ The panels use a randomly initialized small QHformer v2 on one water molecule. T
 2. DeepSeek-V4: [Technical report](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/DeepSeek_V4.pdf) and [Transformers model documentation](https://huggingface.co/docs/transformers/main/model_doc/deepseek_v4)
 3. e3nn: [e3nn documentation](https://docs.e3nn.org/)
 4. EquiformerV2: [atomicarchitects/equiformer_v2](https://github.com/atomicarchitects/equiformer_v2)
-5. DeepH-2: [mzjb/DeepH-pack](https://github.com/mzjb/DeepH-pack)
+5. Reducing SO(3) Convolutions to SO(2): [arXiv:2302.03655](https://arxiv.org/abs/2302.03655)
+6. DeePTB-E3: [deepmodeling/DeePTB](https://github.com/deepmodeling/DeePTB), [ICLR 2025 Spotlight](https://openreview.net/forum?id=kpq3IIjUD3)
+7. DeepH-2: [mzjb/DeepH-pack](https://github.com/mzjb/DeepH-pack)
 
 ## Author
 

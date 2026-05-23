@@ -168,6 +168,7 @@ def build_model(args, device):
         hca_lmax=args.hca_lmax,
         indexer_compress_dim=args.indexer_compress_dim,
         attention_score_residual_init_std=0.0,
+        attention_operator=args.attention_operator,
     ).to(device)
     model.set(device)
     if args.checkpoint:
@@ -275,6 +276,7 @@ def parse_args():
     parser.add_argument("--hca-top-k", type=int, default=8)
     parser.add_argument("--hca-lmax", type=int, default=3)
     parser.add_argument("--indexer-compress-dim", type=int, default=32)
+    parser.add_argument("--attention-operator", choices=["tp", "so2"], default="tp")
     parser.add_argument("--max-radius", type=float, default=7.0)
     parser.add_argument("--radius-embed-dim", type=int, default=64)
     parser.add_argument("--device", default="cuda:0")

@@ -42,9 +42,10 @@ def main():
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--attention-operator", choices=["tp", "so2"], default=None)
     args = parser.parse_args()
 
-    config = config_from_base(
+    overrides = dict(
         dataset_name=args.molecule,
         data_fraction=1.0,
         train_split=args.train_split,
@@ -61,6 +62,9 @@ def main():
         log_interval=args.log_interval,
         seed=args.seed,
     )
+    if args.attention_operator is not None:
+        overrides["attention_operator"] = args.attention_operator
+    config = config_from_base(**overrides)
 
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -105,6 +109,7 @@ def main():
         hca_lmax=config.hca_lmax,
         indexer_compress_dim=config.indexer_compress_dim,
         attention_score_residual_init_std=config.attention_score_residual_init_std,
+        attention_operator=config.attention_operator,
     ).to(config.device)
     model.set(config.device)
     logger.info("Model parameters: %d", sum(p.numel() for p in model.parameters() if p.requires_grad))

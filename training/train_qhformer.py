@@ -147,6 +147,7 @@ class Config:
     hca_lmax = 3
     indexer_compress_dim = 32
     attention_score_residual_init_std = 0.0
+    attention_operator = "tp"
 
     # Training parameters
     num_epochs = 15000
@@ -637,6 +638,7 @@ def main():
         hca_lmax=config.hca_lmax,
         indexer_compress_dim=config.indexer_compress_dim,
         attention_score_residual_init_std=config.attention_score_residual_init_std,
+        attention_operator=config.attention_operator,
     ).to(config.device)
 
     # Set device for model-specific tensors

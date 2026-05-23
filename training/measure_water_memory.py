@@ -76,6 +76,7 @@ def parse_args():
     parser.add_argument("--hca-lmax", type=int, default=2)
     parser.add_argument("--indexer-compress-dim", type=int, default=32)
     parser.add_argument("--attention-score-residual-init-std", type=float, default=0.0)
+    parser.add_argument("--attention-operator", choices=["tp", "so2"], default="tp")
     parser.add_argument(
         "--optimizer-lr",
         type=float,
@@ -123,6 +124,7 @@ def make_model(args, device):
         hca_lmax=args.hca_lmax,
         indexer_compress_dim=args.indexer_compress_dim,
         attention_score_residual_init_std=args.attention_score_residual_init_std,
+        attention_operator=args.attention_operator,
     ).to(device)
     model.set(device)
     return model

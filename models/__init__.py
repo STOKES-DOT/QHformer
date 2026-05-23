@@ -29,6 +29,7 @@ from .qhformer import (
     SelfNetLayer,
     PairNetLayer,
 )
+from .so2_ops import SO2EdgeConv, init_edge_frame
 
 __all__ = [
     # Main model
@@ -49,6 +50,8 @@ __all__ = [
     # QHNet components
     'SelfNetLayer',
     'PairNetLayer',
+    'SO2EdgeConv',
+    'init_edge_frame',
 
     # Utility modules
     'InnerProduct',

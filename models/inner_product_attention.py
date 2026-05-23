@@ -27,8 +27,10 @@ from e3nn.nn import FullyConnectedNet
 
 try:
     from .torch_ops import scatter
+    from .so2_ops import SO2EdgeConv
 except ImportError:
     from torch_ops import scatter
+    from so2_ops import SO2EdgeConv
 
 
 def get_feasible_irrep(irrep_in1, irrep_in2, cutoff_irrep_out, tp_mode="uvu"):
@@ -284,6 +286,25 @@ def pad_irrep_tensor(x, source_irreps, target_irreps):
     return torch.cat(pieces, dim=-1)
 
 
+def _build_tensor_product(
+    irreps_in1,
+    irreps_in2,
+    irreps_out,
+    instructions,
+    *,
+    shared_weights,
+    internal_weights,
+):
+    return TensorProduct(
+        irreps_in1,
+        irreps_in2,
+        irreps_out,
+        instructions,
+        shared_weights=shared_weights,
+        internal_weights=internal_weights,
+    )
+
+
 class MultiHeadInnerProduct(nn.Module):
     """Per-head invariant inner product over matching irreps."""
 
@@ -500,6 +521,7 @@ class MultiHeadAttentionLayer(nn.Module):
         attention_temperature=1.0,
         num_heads=4,
         attention_score_residual_init_std=0.0,
+        attention_operator="tp",
     ):
         super().__init__()
         self.edge_attr_dim = edge_attr_dim
@@ -507,9 +529,12 @@ class MultiHeadAttentionLayer(nn.Module):
         self.use_norm_gate = use_norm_gate
         self.temperature = attention_temperature
         self.num_heads = num_heads
+        self.attention_operator = attention_operator
         self.invariant_layers = invariant_layers
         self.invariant_neurons = invariant_neurons
         self.attention_score_residual_init_std = attention_score_residual_init_std
+        if attention_operator not in {"tp", "so2"}:
+            raise ValueError(f"attention_operator must be 'tp' or 'so2', got {attention_operator}")
 
         self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
         self.irrep_hidden = o3.Irreps(irrep_hidden) if not isinstance(irrep_hidden, o3.Irreps) else irrep_hidden
@@ -535,33 +560,41 @@ class MultiHeadAttentionLayer(nn.Module):
             biases=True,
         )
 
-        self.irrep_tp_key, instruction_key = get_feasible_irrep(
-            self.irrep_in_node, self.sh_irrep, self.irrep_in_node, tp_mode='uvu'
-        )
-        self.tp_key = TensorProduct(
-            self.irrep_in_node,
-            self.sh_irrep,
-            self.irrep_tp_key,
-            instruction_key,
-            shared_weights=False,
-            internal_weights=False,
-        )
+        if self.attention_operator == "so2":
+            self.irrep_tp_key = self.irrep_in_node
+            self.tp_key = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_key)
+        else:
+            self.irrep_tp_key, instruction_key = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.irrep_in_node, tp_mode='uvu'
+            )
+            self.tp_key = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_key,
+                instruction_key,
+                shared_weights=False,
+                internal_weights=False,
+            )
         self.fc_key = FullyConnectedNet(
             [edge_attr_dim] + invariant_layers * [invariant_neurons] + [self.tp_key.weight_numel],
             self.nonlinear,
         )
 
-        self.irrep_tp_value, instruction_value = get_feasible_irrep(
-            self.irrep_in_node, self.sh_irrep, self.irrep_hidden, tp_mode='uvu'
-        )
-        self.tp_value = TensorProduct(
-            self.irrep_in_node,
-            self.sh_irrep,
-            self.irrep_tp_value,
-            instruction_value,
-            shared_weights=False,
-            internal_weights=False,
-        )
+        if self.attention_operator == "so2":
+            self.irrep_tp_value = self.irrep_hidden
+            self.tp_value = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_value)
+        else:
+            self.irrep_tp_value, instruction_value = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.irrep_hidden, tp_mode='uvu'
+            )
+            self.tp_value = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_value,
+                instruction_value,
+                shared_weights=False,
+                internal_weights=False,
+            )
         self.fc_value = FullyConnectedNet(
             [edge_attr_dim] + invariant_layers * [invariant_neurons] + [self.tp_value.weight_numel],
             self.nonlinear,
@@ -652,18 +685,34 @@ class MultiHeadAttentionLayer(nn.Module):
             ], dim=-1)
         return s0
 
-    def _project_key_value(self, x, edge_src, edge_sh, edge_attr, s0):
-        key = self.tp_key(
-            x[edge_src],
-            edge_sh,
-            self.fc_key(edge_attr) * self.layer_l0_key(s0),
-        )
-        value = self.tp_value(
-            x[edge_src],
-            edge_sh,
-            self.fc_value(edge_attr) * self.layer_l0_value(s0),
-        )
+    def _project_key_value(self, x, edge_dst, edge_src, edge_sh, edge_attr, s0, edge_vec=None):
+        key_weight = self.fc_key(edge_attr) * self.layer_l0_key(s0)
+        value_weight = self.fc_value(edge_attr) * self.layer_l0_value(s0)
+        if self.attention_operator == "so2":
+            if edge_vec is None:
+                raise ValueError("SO(2) attention projection requires edge_vec")
+            key = self.tp_key(x[edge_src], edge_vec, key_weight)
+            value = self.tp_value(x[edge_src], edge_vec, value_weight)
+        else:
+            key = self.tp_key(
+                x[edge_src],
+                edge_sh,
+                key_weight,
+            )
+            value = self.tp_value(
+                x[edge_src],
+                edge_sh,
+                value_weight,
+            )
         return key, value
+
+    def _edge_vec(self, data, edge_dst, edge_src):
+        if hasattr(data, "edge_vec") and data.edge_vec.shape[0] == edge_dst.shape[0]:
+            return data.edge_vec
+        if not hasattr(data, "pos"):
+            return None
+        edge_vec = data.pos[edge_dst.long()] - data.pos[edge_src.long()]
+        return edge_vec[:, [1, 2, 0]]
 
     def _multihead_attention(self, query, key, value, edge_dst, key_irrep, value_irrep, num_nodes):
         query_heads = split_irreps_multiplicity(query, key_irrep, self.num_heads)
@@ -729,7 +778,9 @@ class MultiHeadAttentionLayer(nn.Module):
 
         s0 = self._compute_s0(x, edge_dst, edge_src)
         query = self.linear_query(x)
-        key, value = self._project_key_value(x, edge_src, data.edge_sh, data.edge_attr, s0)
+        edge_vec = self._edge_vec(data, edge_dst, edge_src)
+        key, value = self._project_key_value(
+            x, edge_dst, edge_src, data.edge_sh, data.edge_attr, s0, edge_vec=edge_vec)
         attended = self._multihead_attention(
             query, key, value, edge_dst,
             self.irrep_tp_key, self.irrep_tp_value, num_nodes,
@@ -757,6 +808,7 @@ class MultiHeadAttentionNetLayer(nn.Module):
         attention_temperature=1.0,
         num_heads=4,
         attention_score_residual_init_std=0.0,
+        attention_operator="tp",
     ):
         super().__init__()
         self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
@@ -776,6 +828,7 @@ class MultiHeadAttentionNetLayer(nn.Module):
             attention_temperature=attention_temperature,
             num_heads=num_heads,
             attention_score_residual_init_std=attention_score_residual_init_std,
+            attention_operator=attention_operator,
         )
 
     def forward(self, data, x):
@@ -817,14 +870,18 @@ class CompressedSparseAttentionLayer(MultiHeadAttentionLayer):
         sel_mask = self._select_topk(relevance, edge_dst, self.top_k)
         sel_dst = edge_dst[sel_mask]
         sel_src = edge_src[sel_mask]
+        edge_vec = self._edge_vec(data, edge_dst, edge_src)
+        sel_edge_vec = edge_vec[sel_mask] if edge_vec is not None else None
 
         query = self.linear_query(x)
         key, value = self._project_key_value(
             x,
+            sel_dst,
             sel_src,
             data.edge_sh[sel_mask],
             data.edge_attr[sel_mask],
             s0_full[sel_mask],
+            edge_vec=sel_edge_vec,
         )
         attended = self._multihead_attention(
             query, key, value, sel_dst,
@@ -855,6 +912,7 @@ class CompressedSparseAttentionNetLayer(nn.Module):
         top_k=8,
         indexer_compress_dim=32,
         attention_score_residual_init_std=0.0,
+        attention_operator="tp",
     ):
         super().__init__()
         self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
@@ -876,6 +934,7 @@ class CompressedSparseAttentionNetLayer(nn.Module):
             top_k=top_k,
             indexer_compress_dim=indexer_compress_dim,
             attention_score_residual_init_std=attention_score_residual_init_std,
+            attention_operator=attention_operator,
         )
 
     def forward(self, data, x):
@@ -893,33 +952,41 @@ class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
         self.hca_key_irrep = _filter_irrep_lmax(self.irrep_in_node, hca_lmax)
         self.hca_value_irrep = _filter_irrep_lmax(self.irrep_hidden, hca_lmax)
 
-        self.irrep_tp_key, instruction_key = get_feasible_irrep(
-            self.irrep_in_node, self.sh_irrep, self.hca_key_irrep, tp_mode='uvu'
-        )
-        self.tp_key = TensorProduct(
-            self.irrep_in_node,
-            self.sh_irrep,
-            self.irrep_tp_key,
-            instruction_key,
-            shared_weights=False,
-            internal_weights=False,
-        )
+        if self.attention_operator == "so2":
+            self.irrep_tp_key = self.hca_key_irrep
+            self.tp_key = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_key)
+        else:
+            self.irrep_tp_key, instruction_key = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.hca_key_irrep, tp_mode='uvu'
+            )
+            self.tp_key = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_key,
+                instruction_key,
+                shared_weights=False,
+                internal_weights=False,
+            )
         self.fc_key = FullyConnectedNet(
             [self.edge_attr_dim] + self.invariant_layers * [self.invariant_neurons] + [self.tp_key.weight_numel],
             self.nonlinear,
         )
 
-        self.irrep_tp_value, instruction_value = get_feasible_irrep(
-            self.irrep_in_node, self.sh_irrep, self.hca_value_irrep, tp_mode='uvu'
-        )
-        self.tp_value = TensorProduct(
-            self.irrep_in_node,
-            self.sh_irrep,
-            self.irrep_tp_value,
-            instruction_value,
-            shared_weights=False,
-            internal_weights=False,
-        )
+        if self.attention_operator == "so2":
+            self.irrep_tp_value = self.hca_value_irrep
+            self.tp_value = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_value)
+        else:
+            self.irrep_tp_value, instruction_value = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.hca_value_irrep, tp_mode='uvu'
+            )
+            self.tp_value = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_value,
+                instruction_value,
+                shared_weights=False,
+                internal_weights=False,
+            )
         self.fc_value = FullyConnectedNet(
             [self.edge_attr_dim] + self.invariant_layers * [self.invariant_neurons] + [self.tp_value.weight_numel],
             self.nonlinear,
@@ -978,21 +1045,26 @@ class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
             sel_edge_sh = data.edge_sh[sel_mask]
             sel_edge_attr = data.edge_attr[sel_mask]
             sel_s0 = s0_full[sel_mask]
+            edge_vec = self._edge_vec(data, edge_dst, edge_src)
+            sel_edge_vec = edge_vec[sel_mask] if edge_vec is not None else None
         else:
             sel_dst = edge_dst
             sel_src = edge_src
             sel_edge_sh = data.edge_sh
             sel_edge_attr = data.edge_attr
             sel_s0 = s0_full
+            sel_edge_vec = self._edge_vec(data, edge_dst, edge_src)
 
         query = self.linear_query(x)
         query_hca = filter_irrep_tensor_lmax(query, self.irrep_in_node, self.hca_lmax)
         key, value = self._project_key_value(
             x,
+            sel_dst,
             sel_src,
             sel_edge_sh,
             sel_edge_attr,
             sel_s0,
+            edge_vec=sel_edge_vec,
         )
         attended_hca = self._multihead_attention(
             query_hca, key, value, sel_dst,
@@ -1025,6 +1097,7 @@ class HeavyCompressedAttentionNetLayer(nn.Module):
         top_k=8,
         indexer_compress_dim=32,
         attention_score_residual_init_std=0.0,
+        attention_operator="tp",
     ):
         super().__init__()
         self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
@@ -1047,6 +1120,7 @@ class HeavyCompressedAttentionNetLayer(nn.Module):
             top_k=top_k,
             indexer_compress_dim=indexer_compress_dim,
             attention_score_residual_init_std=attention_score_residual_init_std,
+            attention_operator=attention_operator,
         )
 
     def forward(self, data, x):

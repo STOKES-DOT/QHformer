@@ -446,6 +446,7 @@ class QHformer(nn.Module):
         hca_lmax: Maximum angular degree retained in HCA K/V compression
         indexer_compress_dim: Hidden dimension of CSA Lightning Indexer
         attention_score_residual_init_std: Std for nonzero learnable attention-score residual init.
+        attention_operator: "tp" for e3nn TensorProduct K/V, "so2" for edge-frame SO(2) K/V
     """
 
     def __init__(
@@ -466,6 +467,7 @@ class QHformer(nn.Module):
         hca_lmax=2,
         indexer_compress_dim=32,
         attention_score_residual_init_std=0.0,
+        attention_operator="tp",
     ):
         super(QHformer, self).__init__()
         self.order = sh_lmax
@@ -483,6 +485,7 @@ class QHformer(nn.Module):
         self.hca_lmax = hca_lmax
         self.indexer_compress_dim = indexer_compress_dim
         self.attention_score_residual_init_std = attention_score_residual_init_std
+        self.attention_operator = attention_operator
 
         # Use atomic number embedding (max Z=118 for periodic table)
         self.node_embedding = nn.Embedding(118, self.hs)
@@ -504,6 +507,7 @@ class QHformer(nn.Module):
         print(f"QHformer initialized with Multi-Head {'Hybrid CSA/HCA' if use_hybrid_attention else 'Dense'} Attention:")
         print(f"  attention_temperature = {attention_temperature}")
         print(f"  num_heads = {num_heads}")
+        print(f"  attention_operator = {attention_operator}")
         if use_hybrid_attention:
             print(f"  pattern = CSA-HCA-CSA-HCA")
             print(f"  csa_top_k = {csa_top_k}")
@@ -535,6 +539,7 @@ class QHformer(nn.Module):
                         top_k=csa_top_k,
                         indexer_compress_dim=indexer_compress_dim,
                         attention_score_residual_init_std=attention_score_residual_init_std,
+                        attention_operator=attention_operator,
                     )
                 else:
                     layer = HeavyCompressedAttentionNetLayer(
@@ -552,6 +557,7 @@ class QHformer(nn.Module):
                         top_k=hca_top_k,
                         indexer_compress_dim=indexer_compress_dim,
                         attention_score_residual_init_std=attention_score_residual_init_std,
+                        attention_operator=attention_operator,
                     )
             else:
                 layer = MultiHeadAttentionNetLayer(
@@ -566,6 +572,7 @@ class QHformer(nn.Module):
                     attention_temperature=attention_temperature,
                     num_heads=num_heads,
                     attention_score_residual_init_std=attention_score_residual_init_std,
+                    attention_operator=attention_operator,
                 )
             self.e3_gnn_layer.append(layer)
 

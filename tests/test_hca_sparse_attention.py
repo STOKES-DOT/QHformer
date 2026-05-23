@@ -43,7 +43,7 @@ def test_hca_projects_key_value_only_on_topk_edges():
     x = torch.randn(3, layer.irrep_in_node.dim)
     captured = {}
 
-    def fake_project_key_value(x_arg, edge_src, edge_sh, edge_attr, s0):
+    def fake_project_key_value(x_arg, edge_dst, edge_src, edge_sh, edge_attr, s0, edge_vec=None):
         captured["num_projected_edges"] = int(edge_src.numel())
         captured["edge_attr_rows"] = int(edge_attr.shape[0])
         return (

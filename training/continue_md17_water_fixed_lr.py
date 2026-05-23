@@ -87,6 +87,7 @@ def main():
         hca_lmax=config.hca_lmax,
         indexer_compress_dim=config.indexer_compress_dim,
         attention_score_residual_init_std=config.attention_score_residual_init_std,
+        attention_operator=config.attention_operator,
     ).to(config.device)
     model.set(config.device)
     incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=False)

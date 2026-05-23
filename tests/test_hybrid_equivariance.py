@@ -38,7 +38,7 @@ def _mock_edge_data(num_nodes=5, edge_attr_dim=8, sh_lmax=4):
         normalize=True,
         normalization="component",
     )
-    return Data(edge_index=edge_index, edge_attr=edge_attr, edge_sh=edge_sh)
+    return Data(pos=pos, edge_index=edge_index, edge_attr=edge_attr, edge_sh=edge_sh)
 
 
 def test_split_and_merge_irreps_follow_multiplicity_axis():
@@ -212,6 +212,34 @@ def test_hybrid_attention_layers_return_full_finite_irreps():
         assert torch.isfinite(out).all()
 
 
+def test_attention_layer_can_use_so2_operator():
+    torch.manual_seed(8)
+    irrep = o3.Irreps("8x0e + 8x1o + 8x2e")
+    sh_irrep = o3.Irreps.spherical_harmonics(lmax=2)
+    data = _mock_edge_data(num_nodes=5, edge_attr_dim=8, sh_lmax=2)
+    x = torch.randn(5, irrep.dim) * 0.1
+    layer = MultiHeadAttentionLayer(
+        irrep_in_node=irrep,
+        irrep_hidden=irrep,
+        irrep_out=irrep,
+        sh_irrep=sh_irrep,
+        edge_attr_dim=8,
+        node_attr_dim=8,
+        invariant_layers=1,
+        invariant_neurons=8,
+        nonlinear="ssp",
+        use_norm_gate=True,
+        attention_temperature=1.0,
+        num_heads=4,
+        attention_operator="so2",
+    )
+
+    out = layer(data, x)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+
+
 def test_qhformer_uses_csa_hca_csa_hca_pattern():
     model = QHformer(
         in_node_features=1,
@@ -376,5 +404,61 @@ def test_nonzero_attention_score_init_preserves_hamiltonian_rotation_invariants(
         torch.linalg.eigvalsh(h_original),
         torch.linalg.eigvalsh(h_rotated),
         atol=1e-3,
+        rtol=1e-5,
+    )
+
+
+def test_full_qhformer_so2_attention_rotation_invariants():
+    torch.manual_seed(41)
+    model = QHformer(
+        in_node_features=1,
+        sh_lmax=4,
+        hidden_size=4,
+        bottle_hidden_size=4,
+        num_gnn_layers=4,
+        max_radius=8,
+        radius_embed_dim=8,
+        attention_temperature=1.0,
+        num_heads=4,
+        use_hybrid_attention=True,
+        csa_top_k=2,
+        hca_top_k=2,
+        hca_lmax=2,
+        indexer_compress_dim=8,
+        attention_operator="so2",
+    )
+    model.eval()
+    model.set("cpu")
+
+    atoms = torch.tensor([[8], [1], [1]], dtype=torch.long)
+    pos = torch.tensor(
+        [
+            [0.0000, 0.0000, 0.0000],
+            [0.9572, 0.0000, 0.0000],
+            [-0.2390, 0.9270, 0.0000],
+        ],
+        dtype=torch.float32,
+    )
+    data = Data(
+        pos=pos,
+        atoms=atoms,
+        batch=torch.zeros(3, dtype=torch.long),
+        ptr=torch.tensor([0, 3], dtype=torch.long),
+    )
+
+    rotation = o3.rand_matrix().to(pos.dtype)
+    data_rot = data.clone()
+    data_rot.pos = pos @ rotation.T
+
+    with torch.no_grad():
+        h_original = model(data)["hamiltonian"][0]
+        h_rotated = model(data_rot)["hamiltonian"][0]
+
+    assert (h_rotated - h_original).abs().max().item() > 0.0
+    assert torch.allclose(torch.trace(h_original), torch.trace(h_rotated), atol=1e-5, rtol=1e-5)
+    assert torch.allclose(
+        torch.linalg.eigvalsh(h_original),
+        torch.linalg.eigvalsh(h_rotated),
+        atol=1e-5,
         rtol=1e-5,
     )
