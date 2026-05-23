@@ -1,6 +1,6 @@
-# QHformer v2: SO(3)-Equivariant Hamiltonian Prediction with Hybrid Multi-Head Attention
+# QHformer v2 Sparsity: Hybrid Multi-Head Attention with Optional SO(2) K/V Operators
 
-QHformer predicts quantum Hamiltonian matrices from molecular geometries with SO(3)-equivariant graph neural networks. The `qhformer-v2` branch replaces the legacy single-head inner-product attention stack with a 4-head hybrid attention backbone:
+QHformer predicts quantum Hamiltonian matrices from molecular geometries with SO(3)-equivariant graph neural networks. The `qhformer_v2_sparsity` branch builds on `qhformer-v2`: it keeps the 4-head CSA/HCA hybrid attention backbone and adds an optional DeePTB-style edge-frame SO(2) K/V operator for attention projections.
 
 - **Multi-head inner-product attention** with head splitting only along irrep multiplicity axes.
 - **CSA (Compressed Sparse Attention)** layers with invariant indexer scoring and per-destination top-k edge selection.
@@ -12,6 +12,17 @@ QHformer predicts quantum Hamiltonian matrices from molecular geometries with SO
 The CSA/HCA naming and alternating sparse/compressed attention layout are inspired by the DeepSeek-V4 hybrid attention architecture. QHformer v2 adapts that idea to SO(3)-equivariant molecular graphs: compression and sparsity are applied to equivariant edge attention and K/V irreps rather than to transformer token KV caches.
 
 The old single-head attention path is intentionally not retained in this branch.
+
+## Branch Status
+
+This branch is the active performance branch after `qhformer-v2`.
+
+| Branch | Role | Main technical changes |
+|--------|------|------------------------|
+| `qhformer-v2` | Hybrid-attention baseline | Replaces the legacy single-head attention stack with 4-head CSA/HCA layers, identity-initialized NormGate/residuals, half-edge Hamiltonian assembly, MD17/QH9 utilities, and equivariance diagnostics. |
+| `qhformer_v2_sparsity` | Current SO(2)/sparsity branch | Adds optional `attention_operator="so2"` K/V projections, DeePTB-style per-`|m|` packed channel mixing, device-safe Wigner-D sin/cos rotations, rotation caching, attention sparsity benchmarks, and single-molecule profiling utilities. |
+
+The default remains `attention_operator="tp"` for compatibility with the tensor-product path. Set `attention_operator="so2"` when running the SO(2) K/V operator experiments.
 
 ## Key Ideas
 
