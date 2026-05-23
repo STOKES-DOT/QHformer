@@ -2,6 +2,17 @@
 
 A novel neural network architecture for predicting quantum Hamiltonian matrices from molecular geometries using SO(3)-equivariant graph neural networks with Inner Product Attention mechanism.
 
+## Development Branches
+
+`main` keeps the original QHformer inner-product attention implementation. Active architecture work is split across two development branches:
+
+| Branch | Role | Technical updates |
+|--------|------|-------------------|
+| `qhformer-v2` | Hybrid-attention baseline | Replaces the legacy single-head attention stack with 4-head attention over irrep multiplicities, adds CSA/HCA alternating layers, uses invariant sparse edge selection, compresses HCA K/V to low angular order, identity-initializes NormGate and attention residuals, adds half-edge Hamiltonian assembly, and includes MD17/QH9 training utilities plus equivariance diagnostics. |
+| `qhformer_v2_sparsity` | Current SO(2)/sparsity branch | Builds on `qhformer-v2` and adds optional `attention_operator="so2"` K/V projections through a DeePTB-style edge-frame SO(2) operator, packed per-`|m|` channel mixing, device-safe Wigner-D sin/cos rotations, detached rotation caching, SO(2)/CSA/HCA benchmarks, and single-molecule profiling utilities. |
+
+Use `qhformer-v2` for the tensor-product hybrid-attention baseline. Use `qhformer_v2_sparsity` for the latest SO(2) K/V operator and sparsity-performance experiments.
+
 ## 🌟 Key Innovation
 
 ### Inner Product Attention
