@@ -32,8 +32,10 @@ env/
 
 # Training outputs
 runs/
+remote_artifacts/
 *.log
 training_output*.log
+.mplconfig/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -55,8 +57,6 @@ dataset/
 *.hdf5
 *.h5
 
-# Test outputs
-tests/
 # Allow images in documentation
 !images/*.png
 *.gif
@@ -74,4 +74,5 @@ tests/
 ~$*
 
 # Large files
+.wheels/
 best_checkpoint_backup.pth

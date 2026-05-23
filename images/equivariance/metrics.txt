@@ -1,0 +1,4 @@
+max_abs_matrix_change: 4.23674166e-01
+mae_matrix_change: 3.38290334e-02
+trace_abs_diff: 1.90734863e-06
+max_abs_eigenvalue_diff: 1.90734863e-06

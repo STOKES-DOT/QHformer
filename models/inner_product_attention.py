@@ -25,39 +25,12 @@ from e3nn import o3
 from e3nn.o3 import Linear, TensorProduct
 from e3nn.nn import FullyConnectedNet
 
-# Scatter function with fallback
 try:
-    from torch_scatter import scatter as torch_scatter_fn
-    HAS_TORCH_SCATTER = True
+    from .torch_ops import scatter
+    from .so2_ops import SO2EdgeConv
 except ImportError:
-    HAS_TORCH_SCATTER = False
-
-
-def scatter_pure(src, index, dim_size=None, dim=0, reduce='sum'):
-    """Pure PyTorch scatter implementation"""
-    if dim_size is None:
-        dim_size = int(index.max().item()) + 1 if index.numel() > 0 else 0
-
-    if reduce == 'sum' or reduce == 'add':
-        out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, src)
-    elif reduce == 'mean':
-        out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        counts = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        out.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, src)
-        counts.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, torch.ones_like(src))
-        return out / (counts.clamp(min=1))
-    else:
-        out = torch.zeros(dim_size, *src.shape[1:], dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index.unsqueeze(-1).expand_as(src) if index.dim() == 1 else index, src)
-
-
-def scatter(src, index, dim_size=None, dim=0, reduce='sum'):
-    """Scatter function with fallback"""
-    if HAS_TORCH_SCATTER:
-        return torch_scatter_fn(src, index, dim=dim, dim_size=dim_size, reduce=reduce)
-    else:
-        return scatter_pure(src, index, dim_size=dim_size, dim=dim, reduce=reduce)
+    from torch_ops import scatter
+    from so2_ops import SO2EdgeConv
 
 
 def get_feasible_irrep(irrep_in1, irrep_in2, cutoff_irrep_out, tp_mode="uvu"):
@@ -211,6 +184,224 @@ class EquivariantNorm(nn.Module):
         return normalized_x
 
 
+def _per_head_irrep(irreps, num_heads):
+    """Split multiplicities evenly across heads without splitting irrep dimensions."""
+    irreps = o3.Irreps(irreps)
+    per_head = []
+    for mul, ir in irreps:
+        if mul % num_heads != 0:
+            raise ValueError(
+                f"Irrep multiplicity {mul} for {ir} is not divisible by "
+                f"num_heads={num_heads}"
+            )
+        per_head.append((mul // num_heads, ir))
+    return o3.Irreps(per_head).simplify()
+
+
+def _filter_irrep_lmax(irreps, lmax):
+    """Keep only irreps with angular degree l <= lmax."""
+    irreps = o3.Irreps(irreps)
+    return o3.Irreps([(mul, ir) for mul, ir in irreps if ir.l <= lmax]).simplify()
+
+
+def split_irreps_multiplicity(x, irreps, num_heads):
+    """Split a flat irrep tensor into heads along the multiplicity axis."""
+    irreps = o3.Irreps(irreps)
+    if x.shape[-1] != irreps.dim:
+        raise ValueError(f"Expected last dim {irreps.dim}, got {x.shape[-1]}")
+
+    pieces = []
+    batch = x.shape[0]
+    for slc, (mul, ir) in zip(irreps.slices(), irreps):
+        if mul % num_heads != 0:
+            raise ValueError(
+                f"Irrep multiplicity {mul} for {ir} is not divisible by "
+                f"num_heads={num_heads}"
+            )
+        mul_per_head = mul // num_heads
+        block = x[:, slc].reshape(batch, num_heads, mul_per_head, ir.dim)
+        pieces.append(block.reshape(batch, num_heads, mul_per_head * ir.dim))
+    return torch.cat(pieces, dim=-1)
+
+
+def merge_heads(x, irreps, num_heads):
+    """Reverse ``split_irreps_multiplicity``."""
+    irreps = o3.Irreps(irreps)
+    if x.dim() != 3:
+        raise ValueError(f"Expected [N, H, D_head], got shape {tuple(x.shape)}")
+    if x.shape[1] != num_heads:
+        raise ValueError(f"Expected {num_heads} heads, got {x.shape[1]}")
+
+    pieces = []
+    start = 0
+    batch = x.shape[0]
+    for mul, ir in irreps:
+        if mul % num_heads != 0:
+            raise ValueError(
+                f"Irrep multiplicity {mul} for {ir} is not divisible by "
+                f"num_heads={num_heads}"
+            )
+        mul_per_head = mul // num_heads
+        width = mul_per_head * ir.dim
+        block = x[:, :, start:start + width]
+        block = block.reshape(batch, num_heads, mul_per_head, ir.dim)
+        pieces.append(block.reshape(batch, mul * ir.dim))
+        start += width
+
+    if start != x.shape[-1]:
+        raise ValueError(f"Unused head channels: consumed {start}, got {x.shape[-1]}")
+    return torch.cat(pieces, dim=-1)
+
+
+def filter_irrep_tensor_lmax(x, irreps, lmax):
+    """Extract all flat irrep blocks with l <= lmax."""
+    irreps = o3.Irreps(irreps)
+    pieces = [x[:, slc] for slc, (_, ir) in zip(irreps.slices(), irreps) if ir.l <= lmax]
+    if not pieces:
+        return x.new_zeros(x.shape[0], 0)
+    return torch.cat(pieces, dim=-1)
+
+
+def pad_irrep_tensor(x, source_irreps, target_irreps):
+    """Pad a reduced irrep tensor with zeros to match target irreps."""
+    source_irreps = o3.Irreps(source_irreps)
+    target_irreps = o3.Irreps(target_irreps)
+    source_by_ir = {}
+    for slc, (mul, ir) in zip(source_irreps.slices(), source_irreps):
+        source_by_ir[(ir.l, ir.p)] = (slc, mul, ir)
+
+    pieces = []
+    for mul, ir in target_irreps:
+        source = source_by_ir.get((ir.l, ir.p))
+        if source is None:
+            pieces.append(x.new_zeros(x.shape[0], mul * ir.dim))
+            continue
+        slc, source_mul, _ = source
+        if source_mul != mul:
+            raise ValueError(
+                f"Cannot pad {source_irreps} to {target_irreps}: "
+                f"multiplicity mismatch for {ir}"
+            )
+        pieces.append(x[:, slc])
+    return torch.cat(pieces, dim=-1)
+
+
+def _build_tensor_product(
+    irreps_in1,
+    irreps_in2,
+    irreps_out,
+    instructions,
+    *,
+    shared_weights,
+    internal_weights,
+):
+    return TensorProduct(
+        irreps_in1,
+        irreps_in2,
+        irreps_out,
+        instructions,
+        shared_weights=shared_weights,
+        internal_weights=internal_weights,
+    )
+
+
+class MultiHeadInnerProduct(nn.Module):
+    """Per-head invariant inner product over matching irreps."""
+
+    def __init__(self, irrep_in, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.irrep_in = o3.Irreps(irrep_in).simplify()
+        self.per_head_irrep = _per_head_irrep(self.irrep_in, num_heads)
+        self.inner_product = InnerProduct(self.per_head_irrep)
+        self.irrep_out = self.inner_product.irrep_out
+
+    def forward(self, features_1, features_2):
+        if features_1.shape != features_2.shape:
+            raise ValueError(
+                f"Multi-head inner product requires equal shapes, got "
+                f"{tuple(features_1.shape)} and {tuple(features_2.shape)}"
+            )
+        if features_1.dim() != 3 or features_1.shape[1] != self.num_heads:
+            raise ValueError(
+                f"Expected [N/E, {self.num_heads}, D_head], got "
+                f"{tuple(features_1.shape)}"
+            )
+
+        n = features_1.shape[0]
+        flat_1 = features_1.reshape(n * self.num_heads, -1)
+        flat_2 = features_2.reshape(n * self.num_heads, -1)
+        out = self.inner_product(flat_1, flat_2)
+        out = out.reshape(n, self.num_heads, -1)
+        return out.transpose(1, 2).contiguous()
+
+
+class InvariantAttentionScore(nn.Module):
+    """
+    Learnable scorer over invariant inner-product channels.
+
+    The base term is the previous fixed inner-product sum.  The learnable
+    residual starts at exactly zero, so initialization preserves existing
+    attention behavior while allowing training to mix invariant channels.
+    """
+
+    def __init__(self, num_invariants, num_heads, hidden_dim=32, residual_init_std=0.0):
+        super().__init__()
+        self.num_invariants = num_invariants
+        self.num_heads = num_heads
+        self.residual_init_std = residual_init_std
+        self.input = nn.Linear(num_invariants, hidden_dim)
+        self.activation = nn.SiLU()
+        self.output = nn.Linear(hidden_dim, 1)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.input.weight, mean=0.0, std=0.001)
+        nn.init.zeros_(self.input.bias)
+        if self.residual_init_std > 0:
+            nn.init.normal_(self.output.weight, mean=0.0, std=self.residual_init_std)
+        else:
+            nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, attention_input):
+        if attention_input.dim() != 3:
+            raise ValueError(
+                f"Expected [E, num_invariants, num_heads], got {tuple(attention_input.shape)}"
+            )
+        if attention_input.shape[1] != self.num_invariants:
+            raise ValueError(
+                f"Expected {self.num_invariants} invariant channels, got {attention_input.shape[1]}"
+            )
+        if attention_input.shape[2] != self.num_heads:
+            raise ValueError(f"Expected {self.num_heads} heads, got {attention_input.shape[2]}")
+
+        base = attention_input.sum(dim=1)
+        num_edges = attention_input.shape[0]
+        flat = attention_input.transpose(1, 2).reshape(num_edges * self.num_heads, self.num_invariants)
+        residual = self.output(self.activation(self.input(flat))).reshape(num_edges, self.num_heads)
+        return base + residual
+
+
+class MultiHeadEquivariantNorm(nn.Module):
+    """Equivariant normalization applied independently to each head."""
+
+    def __init__(self, irreps, num_heads, eps=1e-8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.irreps = o3.Irreps(irreps).simplify()
+        self.per_head_irrep = _per_head_irrep(self.irreps, num_heads)
+        self.norm = EquivariantNorm(self.per_head_irrep, eps=eps)
+
+    def forward(self, x):
+        if x.dim() != 3 or x.shape[1] != self.num_heads:
+            raise ValueError(f"Expected [N/E, {self.num_heads}, D_head], got {tuple(x.shape)}")
+        n = x.shape[0]
+        flat = x.reshape(n * self.num_heads, -1)
+        out = self.norm(flat)
+        return out.reshape(n, self.num_heads, -1)
+
+
 class NormGate(nn.Module):
     """
     Norm-based gate for modulating non-scalar features.
@@ -230,6 +421,11 @@ class NormGate(nn.Module):
             if ir.l != 0:
                 num_mul_wo_0 += mul
 
+        first_mul, first_ir = self.irrep[0]
+        if first_ir.l != 0:
+            raise ValueError("NormGate expects scalar irreps first")
+        self.scalar_mul = first_mul
+
         if num_mul_wo_0 > 0:
             self.mul = o3.ElementwiseTensorProduct(
                 self.irrep[1:], o3.Irreps(f"{num_mul_wo_0}x0e"))
@@ -242,6 +438,15 @@ class NormGate(nn.Module):
 
         self.num_mul = num_mul
         self.num_mul_wo_0 = num_mul_wo_0
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for module in self.fc:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                nn.init.zeros_(module.bias)
+        nn.init.zeros_(self.fc[-1].weight)
+        nn.init.zeros_(self.fc[-1].bias)
 
     def forward(self, x):
         """
@@ -253,14 +458,18 @@ class NormGate(nn.Module):
         Returns:
             gated_x: [N, D] gated features
         """
-        norm_x = self.norm(x)[:, self.irrep.slices()[0].stop:]
-        f0 = torch.cat([x[:, self.irrep.slices()[0]], norm_x], dim=-1)
-        gates = self.fc(f0)
+        scalar_slice = self.irrep.slices()[0]
+        scalar_x = x[:, scalar_slice]
+        norm_x = self.norm(x)[:, self.scalar_mul:]
+        f0 = torch.cat([scalar_x, norm_x], dim=-1)
+        residual = self.fc(f0)
+        scalar_out = scalar_x + residual[:, :self.scalar_mul]
         if self.mul is not None and norm_x.shape[1] > 0:
-            gated = self.mul(x[:, self.irrep.slices()[0].stop:], gates[:, self.irrep.slices()[0].stop:])
-            x = torch.cat([gates[:, self.irrep.slices()[0]], gated], dim=-1)
+            gates = 1.0 + residual[:, self.scalar_mul:]
+            gated = self.mul(x[:, scalar_slice.stop:], gates)
+            x = torch.cat([scalar_out, gated], dim=-1)
         else:
-            x = gates[:, self.irrep.slices()[0]]
+            x = scalar_out
         return x
 
 
@@ -293,39 +502,9 @@ class ExponentialBernsteinRBF(nn.Module):
         return basis
 
 
-class InnerProductAttentionLayer(nn.Module):
-    """
-    Scheme 1: Inner Product Attention Layer
 
-    This layer uses InnerProduct to couple Query and Key irreps to scalars
-    for computing attention weights. The Value maintains full irreps.
-
-    Architecture:
-        1. Query: Linear(node_i) → full_irreps
-        2. Key: TP(node_j, edge_sh, W_k) → full_irreps
-        3. Value: TP(node_j, edge_sh, W_v) → hidden_irreps
-        4. Attention: α_ij = softmax(IP(Query_i, Key_j) / √d)
-        5. Output: Σ_j α_ij · Value_j
-
-    Key Features:
-    - Query and Key maintain full irreps (no scalar compression)
-    - InnerProduct couples irreps to rotation-invariant scalars
-    - Value preserves full equivariant information
-    - Fully SO(3) equivariant
-
-    Args:
-        irrep_in_node: Input node irreps
-        irrep_hidden: Hidden irreps for value
-        irrep_out: Output irreps
-        sh_irrep: Spherical harmonics irreps for edges
-        edge_attr_dim: Edge attribute dimension
-        node_attr_dim: Node attribute dimension
-        invariant_layers: Number of invariant layers for weight networks
-        invariant_neurons: Number of neurons in invariant layers
-        nonlinear: Nonlinear activation ('ssp', 'silu', etc.)
-        use_norm_gate: Whether to use norm gate
-        attention_temperature: Temperature for attention (1/√d)
-    """
+class MultiHeadAttentionLayer(nn.Module):
+    """Multi-head full-irrep inner-product attention."""
 
     def __init__(
         self,
@@ -340,21 +519,32 @@ class InnerProductAttentionLayer(nn.Module):
         nonlinear='ssp',
         use_norm_gate=True,
         attention_temperature=1.0,
+        num_heads=4,
+        attention_score_residual_init_std=0.0,
+        attention_operator="tp",
     ):
-        super(InnerProductAttentionLayer, self).__init__()
-
+        super().__init__()
         self.edge_attr_dim = edge_attr_dim
         self.node_attr_dim = node_attr_dim
         self.use_norm_gate = use_norm_gate
         self.temperature = attention_temperature
+        self.num_heads = num_heads
+        self.attention_operator = attention_operator
+        self.invariant_layers = invariant_layers
+        self.invariant_neurons = invariant_neurons
+        self.attention_score_residual_init_std = attention_score_residual_init_std
+        if attention_operator not in {"tp", "so2"}:
+            raise ValueError(f"attention_operator must be 'tp' or 'so2', got {attention_operator}")
 
-        # Convert to Irreps
         self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
         self.irrep_hidden = o3.Irreps(irrep_hidden) if not isinstance(irrep_hidden, o3.Irreps) else irrep_hidden
         self.irrep_out = o3.Irreps(irrep_out) if not isinstance(irrep_out, o3.Irreps) else irrep_out
         self.sh_irrep = o3.Irreps(sh_irrep) if not isinstance(sh_irrep, o3.Irreps) else sh_irrep
 
-        # Nonlinear activation
+        # Validate multiplicity-axis splitting up front.
+        _per_head_irrep(self.irrep_in_node, num_heads)
+        _per_head_irrep(self.irrep_hidden, num_heads)
+
         if nonlinear == 'ssp':
             self.nonlinear = lambda x: torch.nn.functional.softplus(x) - math.log(2.0)
         elif nonlinear == 'silu':
@@ -362,90 +552,84 @@ class InnerProductAttentionLayer(nn.Module):
         else:
             self.nonlinear = torch.nn.functional.silu
 
-        # ============ Query Projection ============
-        # Query: Keep FULL irreps (no scalar compression!)
         self.linear_query = Linear(
             irreps_in=self.irrep_in_node,
             irreps_out=self.irrep_in_node,
             internal_weights=True,
             shared_weights=True,
-            biases=True
+            biases=True,
         )
 
-        # ============ Key TensorProduct ============
-        # Key: node ⊗ edge_sh → same_irreps (keep full irreps)
-        self.irrep_tp_key, instruction_key = get_feasible_irrep(
-            self.irrep_in_node, self.sh_irrep, self.irrep_in_node, tp_mode='uvu'
-        )
-
-        self.tp_key = TensorProduct(
-            self.irrep_in_node,
-            self.sh_irrep,
-            self.irrep_tp_key,
-            instruction_key,
-            shared_weights=False,
-            internal_weights=False,
-        )
-
+        if self.attention_operator == "so2":
+            self.irrep_tp_key = self.irrep_in_node
+            self.tp_key = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_key)
+        else:
+            self.irrep_tp_key, instruction_key = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.irrep_in_node, tp_mode='uvu'
+            )
+            self.tp_key = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_key,
+                instruction_key,
+                shared_weights=False,
+                internal_weights=False,
+            )
         self.fc_key = FullyConnectedNet(
             [edge_attr_dim] + invariant_layers * [invariant_neurons] + [self.tp_key.weight_numel],
-            self.nonlinear
+            self.nonlinear,
         )
 
-        # ============ Value TensorProduct ============
-        # Value: node ⊗ edge_sh → hidden_irreps
-        self.irrep_tp_value, instruction_value = get_feasible_irrep(
-            self.irrep_in_node, self.sh_irrep, self.irrep_hidden, tp_mode='uvu'
-        )
-
-        self.tp_value = TensorProduct(
-            self.irrep_in_node,
-            self.sh_irrep,
-            self.irrep_tp_value,
-            instruction_value,
-            shared_weights=False,
-            internal_weights=False,
-        )
-
+        if self.attention_operator == "so2":
+            self.irrep_tp_value = self.irrep_hidden
+            self.tp_value = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_value)
+        else:
+            self.irrep_tp_value, instruction_value = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.irrep_hidden, tp_mode='uvu'
+            )
+            self.tp_value = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_value,
+                instruction_value,
+                shared_weights=False,
+                internal_weights=False,
+            )
         self.fc_value = FullyConnectedNet(
             [edge_attr_dim] + invariant_layers * [invariant_neurons] + [self.tp_value.weight_numel],
-            self.nonlinear
+            self.nonlinear,
         )
 
-        # ============ InnerProduct for Attention ============
-        # InnerProduct: Query ⊗ Key → scalar (rotation invariant)
-        self.inner_product = InnerProduct(self.irrep_in_node)
+        self.inner_product = MultiHeadInnerProduct(self.irrep_in_node, num_heads)
+        self.attention_score = InvariantAttentionScore(
+            self.inner_product.irrep_out.dim,
+            num_heads,
+            hidden_dim=invariant_neurons,
+            residual_init_std=attention_score_residual_init_std,
+        )
+        self.query_norm = MultiHeadEquivariantNorm(self.irrep_in_node, num_heads)
+        self.key_norm = MultiHeadEquivariantNorm(self.irrep_tp_key, num_heads)
 
-        # Equivariant normalization for numerical stability
-        self.query_norm = EquivariantNorm(self.irrep_in_node)
-        self.key_norm = EquivariantNorm(self.irrep_tp_key)
-
-        # ============ Additional Components ============
-        # Inner product for s0 (node similarity modulation)
         num_mul = sum(mul for mul, _ in self.irrep_in_node)
         self.inner_product_s0 = InnerProduct(self.irrep_in_node)
-
-        # Layer for s0 modulation
+        s0_dim = num_mul + self.irrep_in_node[0][0]
         self.layer_l0_key = FullyConnectedNet(
-            [num_mul + self.irrep_in_node[0][0]] + invariant_layers * [invariant_neurons] + [self.tp_key.weight_numel],
-            self.nonlinear
+            [s0_dim] + invariant_layers * [invariant_neurons] + [self.tp_key.weight_numel],
+            self.nonlinear,
         )
-
         self.layer_l0_value = FullyConnectedNet(
-            [num_mul + self.irrep_in_node[0][0]] + invariant_layers * [invariant_neurons] + [self.tp_value.weight_numel],
-            self.nonlinear
+            [s0_dim] + invariant_layers * [invariant_neurons] + [self.tp_value.weight_numel],
+            self.nonlinear,
         )
 
-        # ============ Output Projection ============
         self.linear_out = Linear(
             irreps_in=self.irrep_hidden,
             irreps_out=self.irrep_out,
             internal_weights=True,
             shared_weights=True,
-            biases=True
+            biases=True,
         )
 
-        # ============ NormGate (optional) ============
         if use_norm_gate:
             self.norm_gate = NormGate(self.irrep_in_node)
             self.irrep_linear_out, _ = get_feasible_irrep(
@@ -456,162 +640,160 @@ class InnerProductAttentionLayer(nn.Module):
                 irreps_out=self.irrep_linear_out,
                 internal_weights=True,
                 shared_weights=True,
-                biases=True
+                biases=True,
             )
             self.linear_node_pre = Linear(
                 irreps_in=self.irrep_in_node,
                 irreps_out=self.irrep_linear_out,
                 internal_weights=True,
                 shared_weights=True,
-                biases=True
+                biases=True,
             )
 
-        # Initialize weights for numerical stability
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights with small values for numerical stability"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.01)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, FullyConnectedNet):
-                # FullyConnectedNet uses nn.Sequential
                 for sub_module in module:
                     if isinstance(sub_module, nn.Linear):
                         nn.init.normal_(sub_module.weight, mean=0.0, std=0.01)
                         if sub_module.bias is not None:
                             nn.init.zeros_(sub_module.bias)
+        if hasattr(self, "attention_score"):
+            self.attention_score.reset_parameters()
 
     def _compute_s0(self, x, edge_dst, edge_src):
-        """Compute invariant scalar features from node pair for modulation"""
         if self.use_norm_gate:
             pre_x = self.linear_node_pre(x)
             s0 = self.inner_product_s0(pre_x[edge_dst], pre_x[edge_src])[:, self.irrep_in_node.slices()[0].stop:]
             s0 = torch.cat([
                 pre_x[edge_dst][:, self.irrep_in_node.slices()[0]],
                 pre_x[edge_src][:, self.irrep_in_node.slices()[0]],
-                s0
+                s0,
             ], dim=-1)
         else:
             s0 = self.inner_product_s0(x[edge_dst], x[edge_src])[:, self.irrep_in_node.slices()[0].stop:]
             s0 = torch.cat([
                 x[edge_dst][:, self.irrep_in_node.slices()[0]],
                 x[edge_src][:, self.irrep_in_node.slices()[0]],
-                s0
+                s0,
             ], dim=-1)
         return s0
 
+    def _project_key_value(self, x, edge_dst, edge_src, edge_sh, edge_attr, s0, edge_vec=None):
+        key_weight = self.fc_key(edge_attr) * self.layer_l0_key(s0)
+        value_weight = self.fc_value(edge_attr) * self.layer_l0_value(s0)
+        if self.attention_operator == "so2":
+            if edge_vec is None:
+                raise ValueError("SO(2) attention projection requires edge_vec")
+            key = self.tp_key(x[edge_src], edge_vec, key_weight)
+            value = self.tp_value(x[edge_src], edge_vec, value_weight)
+        else:
+            key = self.tp_key(
+                x[edge_src],
+                edge_sh,
+                key_weight,
+            )
+            value = self.tp_value(
+                x[edge_src],
+                edge_sh,
+                value_weight,
+            )
+        return key, value
+
+    def _edge_vec(self, data, edge_dst, edge_src):
+        if hasattr(data, "edge_vec") and data.edge_vec.shape[0] == edge_dst.shape[0]:
+            return data.edge_vec
+        if not hasattr(data, "pos"):
+            return None
+        edge_vec = data.pos[edge_dst.long()] - data.pos[edge_src.long()]
+        return edge_vec[:, [1, 2, 0]]
+
+    def _multihead_attention(self, query, key, value, edge_dst, key_irrep, value_irrep, num_nodes):
+        query_heads = split_irreps_multiplicity(query, key_irrep, self.num_heads)
+        key_heads = split_irreps_multiplicity(key, key_irrep, self.num_heads)
+        value_heads = split_irreps_multiplicity(value, value_irrep, self.num_heads)
+
+        query_norm = self.query_norm(query_heads)
+        key_norm = self.key_norm(key_heads)
+
+        attention_input = self.inner_product(query_norm[edge_dst], key_norm)
+        attention_input = attention_input.clamp(max=5.0, min=-5.0)
+        attention_logits = self.attention_score(attention_input) / self.temperature
+        attention_logits = attention_logits.clamp(max=10.0, min=-10.0)
+
+        attention_stable = attention_logits - attention_logits.max(dim=0, keepdim=True)[0]
+        exp_logits = attention_stable.exp()
+        z = scatter(exp_logits, edge_dst, dim=0, dim_size=num_nodes).clamp(min=1e-10)
+        alpha = (exp_logits / z[edge_dst]).clamp(min=0.0, max=1.0)
+
+        if torch.isnan(alpha).any() or torch.isinf(alpha).any():
+            alpha = torch.ones_like(alpha) / scatter(
+                torch.ones_like(alpha),
+                edge_dst,
+                dim=0,
+                dim_size=num_nodes,
+                reduce='sum',
+            )[edge_dst].clamp(min=1.0)
+
+        attended_heads = scatter(
+            alpha.unsqueeze(-1) * value_heads,
+            edge_dst,
+            dim=0,
+            dim_size=num_nodes,
+        )
+        return merge_heads(attended_heads, value_irrep, self.num_heads)
+
+    def _select_topk(self, relevance, edge_dst, top_k):
+        if top_k is None or edge_dst.numel() == 0:
+            return torch.arange(edge_dst.numel(), dtype=torch.long, device=edge_dst.device)
+
+        scores = relevance.squeeze(-1)
+        edge_order = torch.argsort(scores, descending=True, stable=True)
+        dst_order = torch.argsort(edge_dst[edge_order], stable=True)
+        ordered = edge_order[dst_order]
+        ordered_dst = edge_dst[ordered]
+
+        positions = torch.arange(ordered.numel(), device=edge_dst.device)
+        is_group_start = torch.ones_like(ordered_dst, dtype=torch.bool)
+        is_group_start[1:] = ordered_dst[1:] != ordered_dst[:-1]
+        group_starts = torch.where(is_group_start, positions, torch.zeros_like(positions))
+        group_starts = torch.cummax(group_starts, dim=0).values
+        rank_in_group = positions - group_starts
+        return ordered[rank_in_group < top_k]
+
     def forward(self, data, x):
-        """
-        Forward pass with Inner Product Attention
-
-        Args:
-            data: Graph data with edge_index, edge_attr, edge_sh
-            x: Node features [N, D_in]
-
-        Returns:
-            out: Updated node features [N, D_out]
-        """
         edge_dst, edge_src = data.edge_index[0], data.edge_index[1]
+        num_nodes = x.shape[0]
+        self_x = x
 
-        # Apply NormGate if needed
         if self.use_norm_gate:
             x = self.norm_gate(x)
             x = self.linear_node(x)
 
-        self_x = x  # For residual connection
-
-        # Compute s0 for modulation (shared)
         s0 = self._compute_s0(x, edge_dst, edge_src)
-
-        # ============ Compute Query ============
-        # Query: Keep FULL irreps (no compression to scalar!)
-        query = self.linear_query(x)  # [N, D_in] with full irreps
-
-        # ============ Compute Key ============
-        # Key: TP(node_j, edge_sh, W_k * s0)
-        key_hidden = self.tp_key(
-            x[edge_src],
-            data.edge_sh,
-            self.fc_key(data.edge_attr) * self.layer_l0_key(s0)
-        )  # [E, D_in] with full irreps
-
-        # ============ Compute Value ============
-        # Value: TP(node_j, edge_sh, W_v * s0)
-        value_edge = self.tp_value(
-            x[edge_src],
-            data.edge_sh,
-            self.fc_value(data.edge_attr) * self.layer_l0_value(s0)
-        )  # [E, D_hidden]
-
-        # ============ Compute Attention Weights via InnerProduct ============
-        # InnerProduct couples Query and Key to rotation-invariant scalars
-        # IP(Query_i, Key_j) = Σ_l Σ_m Query_i^(l,m) · Key_j^(l,m)
-
-        # Normalize Query and Key BEFORE InnerProduct to prevent numerical overflow
-        # This is the KEY fix for NaN issues!
-        query_normalized = self.query_norm(query)  # [N, D]
-        key_normalized = self.key_norm(key_hidden)  # [E, D]
-
-        # EQUIVARIANCE FIX: REMOVED clamp() on query_normalized and key_normalized
-        # Applying element-wise clipping to high-order irreps (vectors, tensors) destroys SO(3) equivariance!
-        # Only clamp the scalar attention scores below (which is mathematically safe).
-
-        attention_input = self.inner_product(query_normalized[edge_dst], key_normalized)  # [E, num_scalars]
-
-        # Clamp each scalar channel BEFORE summing to prevent overflow
-        attention_input = attention_input.clamp(max=5.0, min=-5.0)  # Tighter clamping
-
-        # Sum over all scalar channels to get final attention score
-        attention_logits = attention_input.sum(dim=-1, keepdim=True)  # [E, 1]
-        attention_logits = attention_logits / self.temperature
-
-        # More aggressive clamping for numerical stability
-        attention_logits = attention_logits.clamp(max=10.0, min=-10.0)
-
-        # Use softmax for better numerical stability
-        attention_logits_stable = attention_logits - attention_logits.max(dim=0, keepdim=True)[0]
-        exp_logits = attention_logits_stable.exp()
-        z = scatter(exp_logits, edge_dst, dim=0, dim_size=len(x))
-        z = z.clamp(min=1e-10)  # Avoid division by zero
-        alpha = exp_logits / z[edge_dst]
-
-        # Clamp attention weights
-        alpha = alpha.clamp(min=0.0, max=1.0)
-
-        # Check for NaN/Inf - fall back to uniform attention
-        if torch.isnan(alpha).any() or torch.isinf(alpha).any():
-            alpha = torch.ones_like(alpha) / scatter(
-                torch.ones_like(alpha), edge_dst, dim=0, dim_size=len(x), reduce='sum'
-            )[edge_dst]
-
-        # ============ Aggregate with Attention Weights ============
-        # Use simple weighted sum for stability (instead of sqrt(alpha))
-        attended_features = scatter(
-            (alpha * value_edge),
-            edge_dst,
-            dim=0,
-            dim_size=len(x)
+        query = self.linear_query(x)
+        edge_vec = self._edge_vec(data, edge_dst, edge_src)
+        key, value = self._project_key_value(
+            x, edge_dst, edge_src, data.edge_sh, data.edge_attr, s0, edge_vec=edge_vec)
+        attended = self._multihead_attention(
+            query, key, value, edge_dst,
+            self.irrep_tp_key, self.irrep_tp_value, num_nodes,
         )
 
-        # ============ Output Projection ============
-        out = self.linear_out(attended_features)
-
-        # EQUIVARIANCE FIX: REMOVED clamp() on output tensor
-        # Clamping high-order irreps destroys rotational equivariance!
-        # The normalization layers should handle numerical stability.
-
-        # ============ Residual Connection ============
+        out = self.linear_out(attended)
         if self.irrep_in_node == self.irrep_out:
             out = out + self_x
-
         return out
 
 
-class InnerProductAttentionNetLayer(nn.Module):
-    """Wrapper with same interface as standard ConvLayer"""
+class MultiHeadAttentionNetLayer(nn.Module):
+    """Wrapper with the same interface as the previous GNN attention wrapper."""
 
     def __init__(
         self,
@@ -624,14 +806,15 @@ class InnerProductAttentionNetLayer(nn.Module):
         resnet: bool = True,
         use_norm_gate=True,
         attention_temperature=1.0,
+        num_heads=4,
+        attention_score_residual_init_std=0.0,
+        attention_operator="tp",
     ):
-        super(InnerProductAttentionNetLayer, self).__init__()
-
+        super().__init__()
         self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
         self.irrep_out = o3.Irreps(irrep_out) if not isinstance(irrep_out, o3.Irreps) else irrep_out
         self.resnet = resnet and self.irrep_in_node == self.irrep_out
-
-        self.conv = InnerProductAttentionLayer(
+        self.conv = MultiHeadAttentionLayer(
             irrep_in_node=irrep_in_node,
             irrep_hidden=irrep_hidden,
             irrep_out=irrep_out,
@@ -643,16 +826,310 @@ class InnerProductAttentionNetLayer(nn.Module):
             nonlinear='ssp',
             use_norm_gate=use_norm_gate,
             attention_temperature=attention_temperature,
+            num_heads=num_heads,
+            attention_score_residual_init_std=attention_score_residual_init_std,
+            attention_operator=attention_operator,
         )
 
     def forward(self, data, x):
-        out = self.conv(data, x)
+        return self.conv(data, x)
+
+
+class CompressedSparseAttentionLayer(MultiHeadAttentionLayer):
+    """Multi-head CSA with invariant Lightning Indexer top-k pruning."""
+
+    def __init__(self, *args, top_k=8, indexer_compress_dim=32, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.top_k = top_k
+        self.indexer_compress_dim = indexer_compress_dim
+
+        num_mul = sum(mul for mul, _ in self.irrep_in_node)
+        s0_dim = num_mul + self.irrep_in_node[0][0]
+        scorer_in_dim = s0_dim + self.edge_attr_dim
+        self.indexer = nn.Sequential(
+            nn.Linear(scorer_in_dim, indexer_compress_dim),
+            nn.SiLU(),
+            nn.Linear(indexer_compress_dim, 1),
+        )
+        for module in self.indexer:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.001)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, data, x):
+        edge_dst, edge_src = data.edge_index[0], data.edge_index[1]
+        num_nodes = x.shape[0]
+        self_x = x
+
+        if self.use_norm_gate:
+            x = self.norm_gate(x)
+            x = self.linear_node(x)
+
+        s0_full = self._compute_s0(x, edge_dst, edge_src)
+        relevance = self.indexer(torch.cat([s0_full, data.edge_attr], dim=-1))
+        sel_mask = self._select_topk(relevance, edge_dst, self.top_k)
+        sel_dst = edge_dst[sel_mask]
+        sel_src = edge_src[sel_mask]
+        edge_vec = self._edge_vec(data, edge_dst, edge_src)
+        sel_edge_vec = edge_vec[sel_mask] if edge_vec is not None else None
+
+        query = self.linear_query(x)
+        key, value = self._project_key_value(
+            x,
+            sel_dst,
+            sel_src,
+            data.edge_sh[sel_mask],
+            data.edge_attr[sel_mask],
+            s0_full[sel_mask],
+            edge_vec=sel_edge_vec,
+        )
+        attended = self._multihead_attention(
+            query, key, value, sel_dst,
+            self.irrep_tp_key, self.irrep_tp_value, num_nodes,
+        )
+
+        out = self.linear_out(attended)
+        if self.irrep_in_node == self.irrep_out:
+            out = out + self_x
         return out
 
 
+class CompressedSparseAttentionNetLayer(nn.Module):
+    """Wrapper for ``CompressedSparseAttentionLayer``."""
+
+    def __init__(
+        self,
+        irrep_in_node,
+        irrep_hidden,
+        irrep_out,
+        sh_irrep,
+        edge_attr_dim,
+        node_attr_dim,
+        resnet: bool = True,
+        use_norm_gate=True,
+        attention_temperature=1.0,
+        num_heads=4,
+        top_k=8,
+        indexer_compress_dim=32,
+        attention_score_residual_init_std=0.0,
+        attention_operator="tp",
+    ):
+        super().__init__()
+        self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
+        self.irrep_out = o3.Irreps(irrep_out) if not isinstance(irrep_out, o3.Irreps) else irrep_out
+        self.resnet = resnet and self.irrep_in_node == self.irrep_out
+        self.conv = CompressedSparseAttentionLayer(
+            irrep_in_node=irrep_in_node,
+            irrep_hidden=irrep_hidden,
+            irrep_out=irrep_out,
+            sh_irrep=sh_irrep,
+            edge_attr_dim=edge_attr_dim,
+            node_attr_dim=node_attr_dim,
+            invariant_layers=1,
+            invariant_neurons=32,
+            nonlinear='ssp',
+            use_norm_gate=use_norm_gate,
+            attention_temperature=attention_temperature,
+            num_heads=num_heads,
+            top_k=top_k,
+            indexer_compress_dim=indexer_compress_dim,
+            attention_score_residual_init_std=attention_score_residual_init_std,
+            attention_operator=attention_operator,
+        )
+
+    def forward(self, data, x):
+        return self.conv(data, x)
+
+
+class HeavyCompressedAttentionLayer(MultiHeadAttentionLayer):
+    """Multi-head HCA with sparse edge selection plus l<=hca_lmax K/V compression."""
+
+    def __init__(self, *args, hca_lmax=2, top_k=8, indexer_compress_dim=32, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hca_lmax = hca_lmax
+        self.top_k = top_k
+        self.indexer_compress_dim = indexer_compress_dim
+        self.hca_key_irrep = _filter_irrep_lmax(self.irrep_in_node, hca_lmax)
+        self.hca_value_irrep = _filter_irrep_lmax(self.irrep_hidden, hca_lmax)
+
+        if self.attention_operator == "so2":
+            self.irrep_tp_key = self.hca_key_irrep
+            self.tp_key = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_key)
+        else:
+            self.irrep_tp_key, instruction_key = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.hca_key_irrep, tp_mode='uvu'
+            )
+            self.tp_key = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_key,
+                instruction_key,
+                shared_weights=False,
+                internal_weights=False,
+            )
+        self.fc_key = FullyConnectedNet(
+            [self.edge_attr_dim] + self.invariant_layers * [self.invariant_neurons] + [self.tp_key.weight_numel],
+            self.nonlinear,
+        )
+
+        if self.attention_operator == "so2":
+            self.irrep_tp_value = self.hca_value_irrep
+            self.tp_value = SO2EdgeConv(self.irrep_in_node, self.irrep_tp_value)
+        else:
+            self.irrep_tp_value, instruction_value = get_feasible_irrep(
+                self.irrep_in_node, self.sh_irrep, self.hca_value_irrep, tp_mode='uvu'
+            )
+            self.tp_value = _build_tensor_product(
+                self.irrep_in_node,
+                self.sh_irrep,
+                self.irrep_tp_value,
+                instruction_value,
+                shared_weights=False,
+                internal_weights=False,
+            )
+        self.fc_value = FullyConnectedNet(
+            [self.edge_attr_dim] + self.invariant_layers * [self.invariant_neurons] + [self.tp_value.weight_numel],
+            self.nonlinear,
+        )
+
+        num_mul = sum(mul for mul, _ in self.irrep_in_node)
+        s0_dim = num_mul + self.irrep_in_node[0][0]
+        self.layer_l0_key = FullyConnectedNet(
+            [s0_dim] + self.invariant_layers * [self.invariant_neurons] + [self.tp_key.weight_numel],
+            self.nonlinear,
+        )
+        self.layer_l0_value = FullyConnectedNet(
+            [s0_dim] + self.invariant_layers * [self.invariant_neurons] + [self.tp_value.weight_numel],
+            self.nonlinear,
+        )
+        self.inner_product = MultiHeadInnerProduct(self.hca_key_irrep, self.num_heads)
+        self.attention_score = InvariantAttentionScore(
+            self.inner_product.irrep_out.dim,
+            self.num_heads,
+            hidden_dim=self.invariant_neurons,
+            residual_init_std=self.attention_score_residual_init_std,
+        )
+        self.query_norm = MultiHeadEquivariantNorm(self.hca_key_irrep, self.num_heads)
+        self.key_norm = MultiHeadEquivariantNorm(self.irrep_tp_key, self.num_heads)
+
+        self._init_weights()
+        if self.top_k is not None and self.top_k > 0:
+            num_mul = sum(mul for mul, _ in self.irrep_in_node)
+            s0_dim = num_mul + self.irrep_in_node[0][0]
+            scorer_in_dim = s0_dim + self.edge_attr_dim
+            self.indexer = nn.Sequential(
+                nn.Linear(scorer_in_dim, indexer_compress_dim),
+                nn.SiLU(),
+                nn.Linear(indexer_compress_dim, 1),
+            )
+            for module in self.indexer:
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, mean=0.0, std=0.001)
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, data, x):
+        edge_dst, edge_src = data.edge_index[0], data.edge_index[1]
+        num_nodes = x.shape[0]
+        self_x = x
+
+        if self.use_norm_gate:
+            x = self.norm_gate(x)
+            x = self.linear_node(x)
+
+        s0_full = self._compute_s0(x, edge_dst, edge_src)
+        if self.top_k is not None and self.top_k > 0:
+            relevance = self.indexer(torch.cat([s0_full, data.edge_attr], dim=-1))
+            sel_mask = self._select_topk(relevance, edge_dst, self.top_k)
+            sel_dst = edge_dst[sel_mask]
+            sel_src = edge_src[sel_mask]
+            sel_edge_sh = data.edge_sh[sel_mask]
+            sel_edge_attr = data.edge_attr[sel_mask]
+            sel_s0 = s0_full[sel_mask]
+            edge_vec = self._edge_vec(data, edge_dst, edge_src)
+            sel_edge_vec = edge_vec[sel_mask] if edge_vec is not None else None
+        else:
+            sel_dst = edge_dst
+            sel_src = edge_src
+            sel_edge_sh = data.edge_sh
+            sel_edge_attr = data.edge_attr
+            sel_s0 = s0_full
+            sel_edge_vec = self._edge_vec(data, edge_dst, edge_src)
+
+        query = self.linear_query(x)
+        query_hca = filter_irrep_tensor_lmax(query, self.irrep_in_node, self.hca_lmax)
+        key, value = self._project_key_value(
+            x,
+            sel_dst,
+            sel_src,
+            sel_edge_sh,
+            sel_edge_attr,
+            sel_s0,
+            edge_vec=sel_edge_vec,
+        )
+        attended_hca = self._multihead_attention(
+            query_hca, key, value, sel_dst,
+            self.irrep_tp_key, self.irrep_tp_value, num_nodes,
+        )
+        attended = pad_irrep_tensor(attended_hca, self.irrep_tp_value, self.irrep_hidden)
+
+        out = self.linear_out(attended)
+        if self.irrep_in_node == self.irrep_out:
+            out = out + self_x
+        return out
+
+
+class HeavyCompressedAttentionNetLayer(nn.Module):
+    """Wrapper for ``HeavyCompressedAttentionLayer``."""
+
+    def __init__(
+        self,
+        irrep_in_node,
+        irrep_hidden,
+        irrep_out,
+        sh_irrep,
+        edge_attr_dim,
+        node_attr_dim,
+        resnet: bool = True,
+        use_norm_gate=True,
+        attention_temperature=1.0,
+        num_heads=4,
+        hca_lmax=2,
+        top_k=8,
+        indexer_compress_dim=32,
+        attention_score_residual_init_std=0.0,
+        attention_operator="tp",
+    ):
+        super().__init__()
+        self.irrep_in_node = o3.Irreps(irrep_in_node) if not isinstance(irrep_in_node, o3.Irreps) else irrep_in_node
+        self.irrep_out = o3.Irreps(irrep_out) if not isinstance(irrep_out, o3.Irreps) else irrep_out
+        self.resnet = resnet and self.irrep_in_node == self.irrep_out
+        self.conv = HeavyCompressedAttentionLayer(
+            irrep_in_node=irrep_in_node,
+            irrep_hidden=irrep_hidden,
+            irrep_out=irrep_out,
+            sh_irrep=sh_irrep,
+            edge_attr_dim=edge_attr_dim,
+            node_attr_dim=node_attr_dim,
+            invariant_layers=1,
+            invariant_neurons=32,
+            nonlinear='ssp',
+            use_norm_gate=use_norm_gate,
+            attention_temperature=attention_temperature,
+            num_heads=num_heads,
+            hca_lmax=hca_lmax,
+            top_k=top_k,
+            indexer_compress_dim=indexer_compress_dim,
+            attention_score_residual_init_std=attention_score_residual_init_std,
+            attention_operator=attention_operator,
+        )
+
+    def forward(self, data, x):
+        return self.conv(data, x)
+
+
 if __name__ == "__main__":
-    # Test the Inner Product Attention layer
-    print("Testing InnerProductAttentionLayer...")
+    # Test the multi-head inner-product attention layer
+    print("Testing MultiHeadAttentionLayer...")
 
     # Create dummy data
     num_nodes = 10
@@ -682,7 +1159,7 @@ if __name__ == "__main__":
     data.edge_sh = edge_sh
 
     # Create layer
-    layer = InnerProductAttentionLayer(
+    layer = MultiHeadAttentionLayer(
         irrep_in_node=irrep_node,
         irrep_hidden=irrep_hidden,
         irrep_out=irrep_node,
@@ -691,6 +1168,7 @@ if __name__ == "__main__":
         node_attr_dim=128,
         use_norm_gate=True,
         attention_temperature=1.0,
+        num_heads=4,
     )
 
     # Forward pass
@@ -698,4 +1176,4 @@ if __name__ == "__main__":
 
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {out.shape}")
-    print(f"InnerProductAttentionLayer test passed!")
+    print(f"MultiHeadAttentionLayer test passed!")
