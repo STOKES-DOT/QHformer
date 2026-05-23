@@ -164,6 +164,12 @@ Set `attention_operator="so2"` to replace attention K/V tensor products with edg
 
 ## Architecture
 
+### SO(2) Version Overview
+
+The figure below summarizes the `attention_operator="so2"` path in the current sparsity branch: CSA/HCA routing, edge-frame SO(2) K/V projection, Hamiltonian block expansion, and the equivariant output constraint.
+
+![QHformer SO(2) architecture](images/architecture/qhformer_so2_architecture.png)
+
 ### GNN Layer Stack
 
 ```text
