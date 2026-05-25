@@ -320,6 +320,70 @@ The loss keeps the previous form:
 
 MAE is used as the primary reporting metric.
 
+### Example: MD17/SchNOrb Water 5k with SO(2) K/V
+
+The following completed run is a reference example for the current SO(2) branch. It trains on the MD17/SchNOrb water subset with `attention_operator="so2"` and reports Hamiltonian element errors in Hartree.
+
+Remote run:
+
+```bash
+python training/train_qhformer_md17_subset.py \
+  --molecule water \
+  --max-samples 5000 \
+  --train-split 0.8 \
+  --num-epochs 15000 \
+  --batch-size 512 \
+  --attention-operator so2 \
+  --log-dir runs/qhformer_md17_subset \
+  --run-name water5000_so2_b512_gpu5_20260523_183337 \
+  --save-interval 50 \
+  --log-interval 10
+```
+
+Model and training configuration:
+
+| Field | Value |
+|-------|-------|
+| Dataset | MD17/SchNOrb `water` |
+| Samples | 4999 total, 3999 train, 1000 validation |
+| Node input features | 4 |
+| Spherical harmonic cutoff | `sh_lmax=4` |
+| Hidden irreps | `256x0e+256x1o+256x2e+256x3o+256x4e` |
+| `hidden_size` / `bottle_hidden_size` | 256 / 64 |
+| GNN layers | 4, CSA-HCA-CSA-HCA |
+| Attention heads | 4 |
+| CSA / HCA top-k | 8 / 8 |
+| HCA K/V angular cutoff | `hca_lmax=3` |
+| Attention operator | `so2` edge-frame K/V projection |
+| Radius cutoff / radial embedding | 12 / 64 |
+| Batch size | 512 |
+| Optimizer settings | learning rate 1e-3, weight decay 1e-4, grad clip 0.5 |
+| LR schedule | warmup 1e-7 -> 1e-3 over 1000 epochs, minimum 1e-5 |
+| Seed | 42 |
+| Hardware | RTX 5090, physical GPU5 |
+
+Metric definition: `hamiltonian_mae` is the mean absolute error over symmetrized Hamiltonian matrix elements. The unit is Hartree (Ha) per matrix element.
+
+| Result | Value |
+|--------|-------|
+| Final epoch | 15000 / 15000 |
+| Final train MAE | 1.5e-5 Ha |
+| Final validation MAE | 1.7e-5 Ha |
+| Best validation MAE | 1.523e-5 Ha |
+| Best epoch | 14966 |
+| Final learning rate | 1.0e-5 |
+| Completion time | 2026-05-25 09:35:21 CST |
+
+Artifacts:
+
+| Training curves | Validation predictions |
+|-----------------|------------------------|
+| ![Water SO(2) training curves](images/results/water5000_so2_b512/training_curves.png) | ![Water SO(2) validation predictions](images/results/water5000_so2_b512/predictions_val.png) |
+
+| Train predictions | Error distribution |
+|-------------------|--------------------|
+| ![Water SO(2) train predictions](images/results/water5000_so2_b512/predictions_train.png) | ![Water SO(2) error distribution](images/results/water5000_so2_b512/error_distribution.png) |
+
 ### Measure Per-Molecule Memory
 
 ```bash
