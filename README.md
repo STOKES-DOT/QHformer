@@ -324,21 +324,6 @@ MAE is used as the primary reporting metric.
 
 The following completed run is a reference example for the current SO(2) branch. It trains on the MD17/SchNOrb water subset with `attention_operator="so2"` and reports Hamiltonian element errors in Hartree.
 
-Remote run:
-
-```bash
-python training/train_qhformer_md17_subset.py \
-  --molecule water \
-  --max-samples 5000 \
-  --train-split 0.8 \
-  --num-epochs 15000 \
-  --batch-size 512 \
-  --attention-operator so2 \
-  --log-dir runs/qhformer_md17_subset \
-  --run-name water5000_so2_b512_gpu5_20260523_183337 \
-  --save-interval 50 \
-  --log-interval 10
-```
 
 Model and training configuration:
 
@@ -360,7 +345,7 @@ Model and training configuration:
 | Optimizer settings | learning rate 1e-3, weight decay 1e-4, grad clip 0.5 |
 | LR schedule | warmup 1e-7 -> 1e-3 over 1000 epochs, minimum 1e-5 |
 | Seed | 42 |
-| Hardware | RTX 5090, physical GPU5 |
+| Hardware | RTX 5090D 32GB|
 
 Metric definition: `hamiltonian_mae` is the mean absolute error over symmetrized Hamiltonian matrix elements. The unit is Hartree (Ha) per matrix element.
 
@@ -372,17 +357,16 @@ Metric definition: `hamiltonian_mae` is the mean absolute error over symmetrized
 | Best validation MAE | 1.523e-5 Ha |
 | Best epoch | 14966 |
 | Final learning rate | 1.0e-5 |
-| Completion time | 2026-05-25 09:35:21 CST |
 
 Artifacts:
 
-| Error distribution | Validation predictions |
+|Train predictions | Validation predictions |
 |-----------------|------------------------|
-| ![Water SO(2) error distribution](images/results/water5000_so2_b512/error_distribution.png) | ![Water SO(2) validation predictions](images/results/water5000_so2_b512/predictions_val.png) |
+|  ![Water SO(2) train predictions](images/results/water5000_so2_b512/predictions_train.png) | ![Water SO(2) validation predictions](images/results/water5000_so2_b512/predictions_val.png) |
 
-| Train predictions | Training curves |
+|  Error distribution  | Training curves |
 |-------------------|--------------------|
-| ![Water SO(2) train predictions](images/results/water5000_so2_b512/predictions_train.png) |  ![Water SO(2) training curves](images/results/water5000_so2_b512/training_curves.png)|
+| ![Water SO(2) error distribution](images/results/water5000_so2_b512/error_distribution.png) |  ![Water SO(2) training curves](images/results/water5000_so2_b512/training_curves.png)|
 
 ### Measure Per-Molecule Memory
 
