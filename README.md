@@ -376,13 +376,13 @@ Metric definition: `hamiltonian_mae` is the mean absolute error over symmetrized
 
 Artifacts:
 
-| Training curves | Validation predictions |
+| Error distribution | Validation predictions |
 |-----------------|------------------------|
-| ![Water SO(2) training curves](images/results/water5000_so2_b512/training_curves.png) | ![Water SO(2) validation predictions](images/results/water5000_so2_b512/predictions_val.png) |
+| ![Water SO(2) error distribution](images/results/water5000_so2_b512/error_distribution.png) | ![Water SO(2) validation predictions](images/results/water5000_so2_b512/predictions_val.png) |
 
-| Train predictions | Error distribution |
+| Train predictions | Training curves |
 |-------------------|--------------------|
-| ![Water SO(2) train predictions](images/results/water5000_so2_b512/predictions_train.png) | ![Water SO(2) error distribution](images/results/water5000_so2_b512/error_distribution.png) |
+| ![Water SO(2) train predictions](images/results/water5000_so2_b512/predictions_train.png) |  ![Water SO(2) training curves](images/results/water5000_so2_b512/training_curves.png)|
 
 ### Measure Per-Molecule Memory
 
