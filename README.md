@@ -368,6 +368,56 @@ Artifacts:
 |-------------------|--------------------|
 | ![Water SO(2) error distribution](images/results/water5000_so2_b512/error_distribution.png) |  ![Water SO(2) training curves](images/results/water5000_so2_b512/training_curves.png)|
 
+### Example: MD17/SchNOrb Ethanol 5k with SO(2) K/V
+
+The following completed run is the second reference example for the current SO(2) branch, beside the water result above. It uses the same QHformer v2 SO(2) attention operator on the MD17/SchNOrb ethanol subset and reports Hamiltonian element errors in Hartree.
+
+Run name: `ethanol5000_so2_b128_gpu6_20260522_180302`
+
+Model and training configuration:
+
+| Field | Value |
+|-------|-------|
+| Dataset | MD17/SchNOrb `ethanol` |
+| Samples | 5000 total, 4000 train, 1000 validation |
+| Node input features | 4 |
+| Spherical harmonic cutoff | `sh_lmax=4` |
+| Hidden irreps | `256x0e+256x1o+256x2e+256x3o+256x4e` |
+| `hidden_size` / `bottle_hidden_size` | 256 / 64 |
+| GNN layers | 4, CSA-HCA-CSA-HCA |
+| Attention heads | 4 |
+| CSA / HCA top-k | 8 / 8 |
+| HCA K/V angular cutoff | `hca_lmax=3` |
+| Attention operator | `so2` edge-frame K/V projection |
+| Radius cutoff / radial embedding | 12 / 64 |
+| Batch size | 128 |
+| Optimizer settings | learning rate 1e-3, weight decay 1e-4, grad clip 0.5 |
+| LR schedule | warmup 1e-7 -> 1e-3 over 1000 epochs, minimum 1e-5 |
+| Seed | 42 |
+| Hardware | RTX 5090 32GB, remote GPU6 |
+| Exact config | [`config.json`](images/results/ethanol5000_so2_b128/config.json) |
+
+Metric definition: `hamiltonian_mae` is the mean absolute error over symmetrized Hamiltonian matrix elements. The unit is Hartree (Ha) per matrix element.
+
+| Result | Value |
+|--------|-------|
+| Final epoch | 15000 / 15000 |
+| Final train MAE | 1.5e-5 Ha |
+| Final validation MAE | 2.2e-5 Ha |
+| Best validation MAE | 2.180e-5 Ha |
+| Best epoch | 14947 |
+| Final learning rate | 1.0e-5 |
+
+Artifacts:
+
+| Train predictions | Validation predictions |
+|-------------------|------------------------|
+| ![Ethanol SO(2) train predictions](images/results/ethanol5000_so2_b128/predictions_train.png) | ![Ethanol SO(2) validation predictions](images/results/ethanol5000_so2_b128/predictions_val.png) |
+
+| Error distribution | Training curves |
+|--------------------|-----------------|
+| ![Ethanol SO(2) error distribution](images/results/ethanol5000_so2_b128/error_distribution.png) | ![Ethanol SO(2) training curves](images/results/ethanol5000_so2_b128/training_curves.png) |
+
 ### Measure Per-Molecule Memory
 
 ```bash
