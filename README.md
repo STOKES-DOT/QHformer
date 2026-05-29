@@ -395,7 +395,6 @@ Model and training configuration:
 | LR schedule | warmup 1e-7 -> 1e-3 over 1000 epochs, minimum 1e-5 |
 | Seed | 42 |
 | Hardware | RTX 5090 32GB |
-| Exact config | [`config.json`](images/results/ethanol5000_so2_b128/config.json) |
 
 Metric definition: `hamiltonian_mae` is the mean absolute error over symmetrized Hamiltonian matrix elements. The unit is Hartree (Ha) per matrix element.
 
